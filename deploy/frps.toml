@@ -1,0 +1,23 @@
+# frps 服务端配置（放在 203.195.195.52 上）
+# 文件路径示例：/etc/frp/frps.toml  启动：frps -c /etc/frp/frps.toml
+
+bindPort = 7023                 # ← 客户端连接的端口，即你给的 203.195.195.52:7023
+# vhostHTTPPort = 8080         # 若要用域名型 http 反代则放开
+
+log.to = "/var/log/frps.log"
+log.level = "info"
+log.maxDays = 7
+
+auth.method = "token"
+auth.token = "CHANGE_ME_STRONG_TOKEN"     # 与 GitHub Secret FRP_TOKEN 保持一致
+
+# 只允许客户端占用这些远程端口（安全）
+allowPorts = [
+  { start = 18000, end = 18100 },
+]
+
+# 可选：仪表盘
+webServer.addr = "127.0.0.1"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "CHANGE_ME"

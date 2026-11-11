@@ -1,0 +1,271 @@
+name: artex-deploy-frp
+
+# 用途：在 GitHub Actions runner 上从源码构建 ARTEX（Go 后端 + Next 静态前端），
+#      拉起 PostgreSQL，跑起 Web 服务（:8787），再用 frpc 反向代理到公网 frps
+#      （203.195.195.52:7023）。runner 是临时的，所以用 keep-alive + 定时 cron 续命。
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时续一次；新一轮会取消旧一轮（concurrency），实现近乎连续的在线
+    - cron: "0 */6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-artex-frp.yml"
+      - "deploy/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artex-frp
+  cancel-in-progress: true
+
+env:
+  # ---- ARTEX 源码 ----
+  ARTEX_REPO: https://github.com/RuoJi6/ARTEX.git
+  # ---- frp 服务端（你给的 203.195.195.52:7023 作为 frps 的 bind_port）----
+  FRP_SERVER_ADDR: "203.195.195.52"
+  FRP_SERVER_PORT: "7023"
+  # 公网访问端口：需要在 frps 的 allow_ports 与云安全组里放行
+  FRP_REMOTE_PORT: ${{ vars.FRP_REMOTE_PORT || '18087' }}
+  # ---- runner 内部 ----
+  ARTEX_ADDR: ":8787"
+  ARTEX_PROXY: "127.0.0.1:8788"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  serve:
+    name: build + run + frp tunnel
+    runs-on: ubuntu-latest
+    # 单个 job 上限 6h；留 5 分钟余量给收尾
+    timeout-minutes: 355
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        # 一次性容器内数据库，密码仅在本 job 生命周期内有效
+        env:
+          POSTGRES_USER: artex
+          POSTGRES_PASSWORD: artex_ci_ephemeral_pw
+          POSTGRES_DB: artex
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U artex -d artex"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      ARTEX_PG_DSN: postgres://artex:artex_ci_ephemeral_pw@127.0.0.1:5432/artex?sslmode=disable
+      ARTEX_SKILL_DIR: ${{ github.workspace }}/artex/skills
+      FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ARTEX_LLM_PROVIDER: ${{ vars.ARTEX_LLM_PROVIDER }}
+      ARTEX_LLM_MODEL: ${{ vars.ARTEX_LLM_MODEL }}
+      ARTEX_LLM_BASE_URL: ${{ vars.ARTEX_LLM_BASE_URL }}
+
+    steps:
+      # ---------- 1. 取源码 ----------
+      - name: Checkout ARTEX
+        uses: actions/checkout@v4
+        with:
+          repository: Ruoji6/ARTEX
+          path: artex
+          fetch-depth: 1
+
+      - name: Show source revision
+        run: |
+          cd artex
+          commit=$(git rev-parse HEAD)
+          echo "ARTEX_COMMIT=${commit}" >> "$GITHUB_ENV"
+          echo "ARTEX 源码 commit: ${commit}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 2. 前端静态导出 ----------
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: artex/web/package-lock.json
+
+      - name: Build frontend (static export)
+        working-directory: artex/web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:static
+          test -f out/index.html || { echo "静态导出缺少 out/index.html" >&2; exit 1; }
+          du -sh out
+
+      - name: Sync frontend into embed path
+        run: |
+          mkdir -p artex/server/webui/dist
+          cp -a artex/web/out/. artex/server/webui/dist/
+          ls artex/server/webui/dist | head
+
+      # ---------- 3. Go 后端 ----------
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: artex/go.mod
+          check-latest: true
+          cache-dependency-path: artex/go.sum
+
+      - name: Build artex (embedui)
+        working-directory: artex
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go version
+          go build -tags embedui -trimpath \
+            -ldflags "-s -w -X main.version=ci-${GITHUB_SHA::8}" \
+            -o /tmp/artex-bin ./cmd/artex
+          ls -lh /tmp/artex-bin
+          /tmp/artex-bin -h 2>&1 | head -20 || true
+
+      # ---------- 4. frpc ----------
+      - name: Install frpc
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                 https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)
+          echo "frp version: ${ver}"
+          num="${ver#v}"
+          curl -fsSL -o /tmp/frp.tgz \
+            "https://github.com/fatedier/frp/releases/download/${ver}/frp_${num}_linux_amd64.tar.gz"
+          tar -xzf /tmp/frp.tgz -C /tmp
+          install -m 0755 "/tmp/frp_${num}_linux_amd64/frpc" /usr/local/bin/frpc
+          frpc -v
+
+      - name: Render frpc.toml
+        run: |
+          set -euo pipefail
+          {
+            echo "serverAddr = \"${FRP_SERVER_ADDR}\""
+            echo "serverPort = ${FRP_SERVER_PORT}"
+            echo "loginFailExit = false"
+            echo "log.to = \"/tmp/frpc.log\""
+            echo "log.level = \"info\""
+            if [ -n "${FRP_TOKEN}" ]; then
+              echo "auth.method = \"token\""
+              echo "auth.token = \"${FRP_TOKEN}\""
+            fi
+            echo ""
+            echo "[[proxies]]"
+            echo "name = \"artex-web\""
+            echo "type = \"tcp\""
+            echo "localIP = \"127.0.0.1\""
+            echo "localPort = 8787"
+            echo "remotePort = ${FRP_REMOTE_PORT}"
+          } > /tmp/frpc.toml
+          sed -e 's/^\(auth.token = \).*/\1"***"/' /tmp/frpc.toml
+
+      # ---------- 5. 起服务 ----------
+      - name: Start artex
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/artex-data
+          nohup /tmp/artex-bin \
+            -addr "${ARTEX_ADDR}" \
+            -proxy "${ARTEX_PROXY}" \
+            -data /tmp/artex-data \
+            > /tmp/artex.log 2>&1 &
+          echo $! > /tmp/artex.pid
+
+      - name: Wait for health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8787/api/health" 2>/dev/null \
+               || curl -fsS -o /dev/null "http://127.0.0.1:8787/" 2>/dev/null; then
+              echo "artex 已就绪（第 ${i} 次探测）"
+              break
+            fi
+            if ! kill -0 "$(cat /tmp/artex.pid)" 2>/dev/null; then
+              echo "artex 进程已退出，日志：" >&2
+              tail -100 /tmp/artex.log >&2
+              exit 1
+            fi
+            sleep 2
+            if [ "$i" -eq 90 ]; then
+              echo "健康检查超时，日志：" >&2
+              tail -100 /tmp/artex.log >&2
+              exit 1
+            fi
+          done
+          curl -sS -m 5 "http://127.0.0.1:8787/api/health" || true
+
+      - name: Start frpc
+        run: |
+          set -euo pipefail
+          nohup frpc -c /tmp/frpc.toml > /tmp/frpc.stdout 2>&1 &
+          echo $! > /tmp/frpc.pid
+          sleep 8
+          echo "----- frpc 启动输出 -----"
+          cat /tmp/frpc.stdout || true
+          if grep -qiE "start proxy success|start error|login to server success" /tmp/frpc.stdout; then
+            echo "frpc 已与服务端交互"
+          fi
+
+      - name: Publish URL
+        run: |
+          {
+            echo "### ARTEX 已上线"
+            echo ""
+            echo "- 公网地址：http://${FRP_SERVER_ADDR}:${FRP_REMOTE_PORT}"
+            echo "- 本地监听：http://127.0.0.1:8787"
+            echo "- frps：${FRP_SERVER_ADDR}:${FRP_SERVER_PORT}"
+            echo "- ARTEX commit：${ARTEX_COMMIT}"
+            echo "- 触发 commit：${{ github.sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 6. 值守：进程掉线自动拉起，直到 job 时间用尽 ----------
+      - name: Keep alive (auto-restart)
+        # 只有前面全部成功才进入值守；失败时直接走日志步骤暴露问题，不空耗 5 小时
+        if: success()
+        run: |
+          set +e
+          deadline=$(( $(date +%s) + 20400 ))   # ~5h40m
+          echo "值守开始，截止 $(date -d @${deadline} '+%F %T %Z' 2>/dev/null || echo $deadline)"
+          n=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            n=$((n+1))
+            if ! pgrep -f '/tmp/artex-bin' >/dev/null 2>&1; then
+              echo "[$(date +%T)] artex 掉线 → 重启"
+              nohup /tmp/artex-bin -addr "${ARTEX_ADDR}" -proxy "${ARTEX_PROXY}" \
+                -data /tmp/artex-data >> /tmp/artex.log 2>&1 &
+              sleep 15
+            fi
+            if ! pgrep -f 'frpc -c /tmp/frpc.toml' >/dev/null 2>&1; then
+              echo "[$(date +%T)] frpc 掉线 → 重启"
+              nohup frpc -c /tmp/frpc.toml >> /tmp/frpc.stdout 2>&1 &
+              sleep 10
+            fi
+            if [ $((n % 20)) -eq 0 ]; then
+              ok=$(curl -fsS -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:8787/ || echo 000)
+              echo "[$(date +%T)] 心跳 #${n} http=${ok} frp=$(pgrep -fc 'frpc -c /tmp/frpc.toml')"
+            fi
+            sleep 30
+          done
+          echo "值守窗口结束，交给下一次 cron 续接"
+
+      - name: Dump logs
+        if: always()
+        run: |
+          echo "===== artex.log (tail) ====="; tail -60 /tmp/artex.log 2>/dev/null || true
+          echo "===== frpc ====="; tail -40 /tmp/frpc.stdout 2>/dev/null || true
+          tail -60 /tmp/frpc.log 2>/dev/null || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f 'frpc -c /tmp/frpc.toml' 2>/dev/null || true
+          pkill -f '/tmp/artex-bin' 2>/dev/null || true
+          exit 0

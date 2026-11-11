@@ -1,0 +1,36 @@
+# frpc 客户端配置（runner 上由工作流自动生成到 /tmp/frpc.toml）
+# 本文件是同内容的可读版本，方便本地/服务器复用
+
+serverAddr = "203.195.195.52"
+serverPort = 7023
+loginFailExit = false
+
+log.to = "/tmp/frpc.log"
+log.level = "info"
+
+# frps 若配置了 auth.token，这里必须一致；工作流通过 Secret FRP_TOKEN 注入
+# auth.method = "token"
+# auth.token = "YOUR_FRP_TOKEN"
+
+[[proxies]]
+name = "artex-web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8787
+remotePort = 18087          # 公网访问 http://203.195.195.52:18087
+
+# ---------------------------------------------------------------
+# 变体 A：HTTP 域名反代（frps 需要 vhost_http_port，且你有域名解析）
+# ---------------------------------------------------------------
+# [[proxies]]
+# name = "artex-web-http"
+# type = "http"
+# localIP = "127.0.0.1"
+# localPort = 8787
+# customDomains = ["artex.example.com"]
+# # frps 侧需：vhostHTTPPort = 8080
+# # 访问：http://artex.example.com:8080
+#
+# 变体 B：直接用 7023 作为对外 Web 端口（把 7023 当 vhostHTTPPort 用）
+# 则 frps 配置改为 vhostHTTPPort = 7023，客户端用 type = "http" + customDomains，
+# 或者保留 type="tcp" 但 remotePort = 7023（frps 的 bindPort 就不能也是 7023）。
