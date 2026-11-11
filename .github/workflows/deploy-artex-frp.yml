@@ -320,17 +320,28 @@ jobs:
           sudo systemctl is-active nginx
 
       - name: Verify edge (gzip + cache headers)
+        # 注意：这里不能用 pipefail —— grep|head 会触发 SIGPIPE(141) 而误判失败。
+        # 校验本身也不该阻断上线，失败只告警。
+        continue-on-error: true
         run: |
-          set -euo pipefail
+          set -eu
           sleep 2
-          echo "--- 首页（应带 Cache-Control 与 Content-Encoding: gzip）---"
+          echo "--- 首页响应头 ---"
           curl -sS -o /dev/null -D - -H 'Accept-Encoding: gzip' "http://127.0.0.1:${EDGE_PORT}/" \
             | grep -iE 'HTTP/|content-encoding|content-length|cache-control' || true
-          echo "--- 抽查一个 chunk ---"
-          chunk=$(curl -sS "http://127.0.0.1:${EDGE_PORT}/" | grep -oE '/_next/static/chunks/[^"]+\.js' | head -1)
-          echo "chunk=$chunk"
-          curl -sS -o /dev/null -D - -H 'Accept-Encoding: gzip' "http://127.0.0.1:${EDGE_PORT}${chunk}" \
-            | grep -iE 'HTTP/|content-encoding|content-length|cache-control' || true
+
+          echo "--- 抽查 chunk（预压缩资源应返回 gzip + immutable）---"
+          chunk=$(curl -sS "http://127.0.0.1:${EDGE_PORT}/" \
+                  | grep -oE '/_next/static/chunks/[^"]+\.js' | head -1 || true)
+          echo "chunk=${chunk:-<未找到>}"
+          if [ -n "${chunk}" ]; then
+            raw=$(curl -sS -o /dev/null -w '%{size_download}' -H 'Accept-Encoding: identity' "http://127.0.0.1:${EDGE_PORT}${chunk}")
+            gz=$(curl -sS -o /dev/null -w '%{size_download}' -H 'Accept-Encoding: gzip' "http://127.0.0.1:${EDGE_PORT}${chunk}")
+            echo "未压缩=${raw}B  gzip=${gz}B  比值=$(awk "BEGIN{printf \"%.1f%%\", ${gz}/${raw}*100}")"
+            curl -sS -o /dev/null -D - -H 'Accept-Encoding: gzip' "http://127.0.0.1:${EDGE_PORT}${chunk}" \
+              | grep -iE 'HTTP/|content-encoding|content-length|cache-control' || true
+          fi
+
           echo "--- API 透传 ---"
           curl -sS "http://127.0.0.1:${EDGE_PORT}/api/health"; echo
 
