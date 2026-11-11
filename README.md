@@ -13,7 +13,7 @@ GitHub Actions runner (ubuntu-latest, 临时)
 │         :8788          (MITM 流量记录代理，仅本地)
 └── frpc ── TCP ──> 203.17023 (frps)
                      └── remotePort 18087 ──> 公网
-公网访问： http://203.195.195.52:18087
+公网访问： http://203
 ```
 
 ARTEX 关键事实（已核对源码）：
