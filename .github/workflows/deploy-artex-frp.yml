@@ -33,6 +33,8 @@ env:
   # ---- runner 内部 ----
   ARTEX_ADDR: ":8787"
   ARTEX_PROXY: "127.0.0.1:8788"
+  # nginx 边缘层端口（frpc 暴露的是它，不是 8787）
+  EDGE_PORT: "8080"
   NEXT_TELEMETRY_DISABLED: "1"
 
 jobs:
@@ -106,6 +108,25 @@ jobs:
           cp -a artex/web/out/. artex/server/webui/dist/
           ls artex/server/webui/dist | head
 
+      # 隧道只有 ~15KB/s，先把静态资源预压缩：nginx gzip_static 直接吐 .gz，
+      # 省掉每次请求的实时压缩开销，压缩比也固定可预期（实测 JS ≈ 40%）。
+      - name: Precompress static assets
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zopfli >/dev/null 2>&1 || sudo apt-get install -y -qq gzip >/dev/null
+          cd "$GITHUB_WORKSPACE/artex/server/webui/dist"
+          before=$(find . -type f ! -name '*.gz' -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+          n=0
+          while IFS= read -r -d '' f; do
+            gzip -9 -k -f "$f" && n=$((n+1))
+          done < <(find . -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' \
+               -o -name '*.json' -o -name '*.svg' -o -name '*.txt' -o -name '*.xml' \) -print0)
+          gz=$(find . -name '*.gz' -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+          echo "预压缩 ${n} 个文件"
+          echo "原始合计 $((before/1024)) KB → .gz 合计 $((gz/1024)) KB"
+          
+
       # ---------- 3. Go 后端 ----------
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -158,14 +179,21 @@ jobs:
               echo "auth.token = \"${FRP_TOKEN}\""
             fi
             echo ""
+            echo "# 以下为客户端级 transport 配置，必须写在 [[proxies]] 之前"
+            echo "transport.poolCount = 4"
+            echo "transport.heartbeatInterval = 15"
+            echo "transport.heartbeatTimeout = 45"
+            echo ""
             echo "[[proxies]]"
             echo "name = \"artex-web\""
             echo "type = \"tcp\""
             echo "localIP = \"127.0.0.1\""
-            echo "localPort = 8787"
+            echo "localPort = ${EDGE_PORT}"
             echo "remotePort = ${FRP_REMOTE_PORT}"
           } > /tmp/frpc.toml
+          echo "----- frpc.toml -----"
           sed -e 's/^\(auth.token = \).*/\1"***"/' /tmp/frpc.toml
+          frpc verify -c /tmp/frpc.toml
 
       # ---------- 5. 起服务 ----------
       - name: Start artex
@@ -201,6 +229,110 @@ jobs:
             fi
           done
           curl -sS -m 5 "http://127.0.0.1:8787/api/health" || true
+
+      # ---------- 边缘层：nginx 直接托管静态资源 + gzip_static + 长缓存 ----------
+      # 目的：1) 静态文件不经 Go，省一次转发；2) .gz 直接吐，1.29MB → ~515KB；
+      #      3) /_next/static 带 hash，给 immutable 一年缓存，二次访问零下载。
+      - name: Install nginx
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nginx >/dev/null
+          nginx -v
+
+      - name: Configure nginx edge
+        run: |
+          set -euo pipefail
+          DIST="$GITHUB_WORKSPACE/artex/server/webui/dist"
+          test -d "$DIST" || { echo "dist 不存在: $DIST" >&2; exit 1; }
+          sudo tee /etc/nginx/sites-available/artex >/dev/null <<EOF
+          map \$http_accept_encoding \$gz_ok {
+              default 0;
+              "~*gzip" 1;
+          }
+
+          server {
+              listen ${EDGE_PORT} default_server;
+              listen [::]:${EDGE_PORT} default_server;
+              server_name _;
+
+              root ${DIST};
+              index index.html;
+
+              # 隧道带宽极小，尽量把压缩与缓存做到极致
+              gzip on;
+              gzip_static on;
+              gzip_comp_level 6;
+              gzip_min_length 256;
+              gzip_proxied any;
+              gzip_types text/plain text/css application/javascript application/json
+                         image/svg+xml application/xml text/xml;
+
+              sendfile on;
+              tcp_nopush on;
+              tcp_nodelay on;
+              keepalive_timeout 120s;
+              keepalive_requests 1000;
+
+              # 带内容 hash 的构建产物：一年不可变缓存
+              location /_next/static/ {
+                  add_header Cache-Control "public, max-age=31536000, immutable" always;
+                  access_log off;
+                  try_files \$uri =404;
+              }
+              location /_next/image/ {
+                  add_header Cache-Control "public, max-age=86400" always;
+                  try_files \$uri =404;
+              }
+              location ~* \.(?:ico|png|jpg|jpeg|gif|webp|avif|woff2?|ttf|otf|map)\$ {
+                  add_header Cache-Control "public, max-age=2592000" always;
+                  access_log off;
+                  try_files \$uri =404;
+              }
+
+              # API 与其余动态请求转发给 Go
+              location /api/ {
+                  proxy_pass http://127.0.0.1:8787;
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_buffering on;
+                  proxy_read_timeout 600s;
+                  proxy_send_timeout 600s;
+                  gzip on;
+                  gzip_proxied any;
+              }
+
+              # 页面：短缓存，兼顾刷新即时性与减少往返
+              location / {
+                  add_header Cache-Control "public, max-age=60" always;
+                  try_files \$uri \$uri/ \$uri/index.html /index.html;
+              }
+          }
+          EOF
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo ln -sf /etc/nginx/sites-available/artex /etc/nginx/sites-enabled/artex
+          sudo nginx -t
+          sudo systemctl restart nginx
+          sudo systemctl is-active nginx
+
+      - name: Verify edge (gzip + cache headers)
+        run: |
+          set -euo pipefail
+          sleep 2
+          echo "--- 首页（应带 Cache-Control 与 Content-Encoding: gzip）---"
+          curl -sS -o /dev/null -D - -H 'Accept-Encoding: gzip' "http://127.0.0.1:${EDGE_PORT}/" \
+            | grep -iE 'HTTP/|content-encoding|content-length|cache-control' || true
+          echo "--- 抽查一个 chunk ---"
+          chunk=$(curl -sS "http://127.0.0.1:${EDGE_PORT}/" | grep -oE '/_next/static/chunks/[^"]+\.js' | head -1)
+          echo "chunk=$chunk"
+          curl -sS -o /dev/null -D - -H 'Accept-Encoding: gzip' "http://127.0.0.1:${EDGE_PORT}${chunk}" \
+            | grep -iE 'HTTP/|content-encoding|content-length|cache-control' || true
+          echo "--- API 透传 ---"
+          curl -sS "http://127.0.0.1:${EDGE_PORT}/api/health"; echo
 
       - name: Start frpc
         run: |
@@ -243,14 +375,19 @@ jobs:
                 -data /tmp/artex-data >> /tmp/artex.log 2>&1 &
               sleep 15
             fi
+            if ! pgrep -f 'nginx: master' >/dev/null 2>&1; then
+              echo "[$(date +%T)] nginx 掉线 → 重启"
+              sudo systemctl restart nginx || sudo nginx
+              sleep 5
+            fi
             if ! pgrep -f 'frpc -c /tmp/frpc.toml' >/dev/null 2>&1; then
               echo "[$(date +%T)] frpc 掉线 → 重启"
               nohup frpc -c /tmp/frpc.toml >> /tmp/frpc.stdout 2>&1 &
               sleep 10
             fi
             if [ $((n % 20)) -eq 0 ]; then
-              ok=$(curl -fsS -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:8787/ || echo 000)
-              echo "[$(date +%T)] 心跳 #${n} http=${ok} frp=$(pgrep -fc 'frpc -c /tmp/frpc.toml')"
+              ok=$(curl -fsS -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${EDGE_PORT}/" || echo 000)
+              echo "[$(date +%T)] 心跳 #${n} edge_http=${ok} frp=$(pgrep -fc 'frpc -c /tmp/frpc.toml')"
             fi
             sleep 30
           done

@@ -2,7 +2,7 @@
 
 目标：在 **Janit8r/hihaff** 仓库上用 GitHub Actions 从源码构建并运行
 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（Go 后端 + Next 静态前端），
-再用 **frpc** 把 Web 端口反代到公网 frps **203**。
+再用 **frpc** 把 Web 端口反代到公网 frps **203.195.195.52:7023**。
 
 ## 0. 架构
 
@@ -11,10 +11,29 @@ GitHub Actions runner (ubuntu-latest, 临时)
 ├── postgres:16-alpine   (job service, 127.0.0.1:5432)
 ├── artex  :8787         (go build -tags embedui，内嵌前端)
 │         :8788          (MITM 流量记录代理，仅本地)
-└── frpc ── TCP ──> 203.17023 (frps)
+├── nginx  :8080         (边缘层：托管静态资源 + gzip_static + 长缓存，/api 反代 8787)
+└── frpc ── TCP ──> 203.195.195.52:7023 (frps)
                      └── remotePort 18087 ──> 公网
-公网访问： http://203
+公网访问： http://203.195.195.52:18087
 ```
+
+### 性能调优（针对隧道带宽瓶颈）
+
+实测该链路（客户端 → 203.195.195.52:7023 → GitHub runner）：单流吞吐 **≈14KB/s**，
+6 路并发总吞吐基本不变（说明是 frps 侧带宽上限，不是并发限制），并伴随传输截断（丢包）。
+首屏 17 个资源共 **1.29MB**，原样传输需 **80s+**。故加 nginx 边缘层，按收益排序：
+
+| 措施 | 效果 |
+|---|---|
+| 预压缩（`gzip -9` 生成 `.gz`）+ `gzip_static on` | 实测 JS 压到 **39.9%**，1.29MB → ≈515KB |
+| `/_next/static/*` 一年 `immutable` 缓存 | 二次访问**零下载**（文件名带 hash） |
+| 页面 60s 短缓存 | 减少重复往返 |
+| nginx 直接托管静态文件 | 省掉 Go 转发开销 |
+| `transport.poolCount = 4` + 心跳收紧 | 丢包后更快恢复 |
+| upstream `keepalive` + `proxy_http_version 1.1` | API 不必每次重建连接 |
+
+预期：首屏 ≈80s → **≈30s**；同一浏览器二次访问**接近秒开**。
+再快只能提高链路带宽（frps 规格/线路）或改国内常驻部署。
 
 ARTEX 关键事实（已核对源码）：
 
@@ -116,7 +135,7 @@ git push -u origin main
 
 # 公网验证（frps 所在网络或任意外网）
 curl -sS -o /dev/null -w '%{http_code}\n' http://203.195.195.52:18087/
-curl -sS http://20387/api/health
+curl -sS http://203.195.195.52:18087/api/health
 ```
 
 Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址；
@@ -150,7 +169,7 @@ GitHub 托管 runner **是临时的**，单个 job 最长 6 小时，结束即�
 
 ## 7. 常驻部署（可选，去掉空窗）
 
-同一个二进制，扔到你的常驻主机（例如 202 自己）跑：
+同一个二进制，扔到你的常驻主机（例如 203.195.195.52 自己）跑：
 
 ```bash
 # 本地产物：/tmp/artex-bin（或用 Actions 上传的 artifact）
