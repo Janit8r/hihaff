@@ -11,7 +11,7 @@ GitHub Actions runner (ubuntu-latest, 临时)
 ├── postgres:16-alpine   (job service, 127.0.0.1:5432)
 ├── artex  :8787         (go build -tags embedui，内嵌前端)
 │         :8788          (MITM 流量记录代理，仅本地)
-└── frpc ── TCP ──> 203.195.195.52:7023 (frps)
+└── frpc ── TCP ──> 203.17023 (frps)
                      └── remotePort 18087 ──> 公网
 公网访问： http://203.195.195.52:18087
 ```
