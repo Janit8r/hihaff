@@ -243,8 +243,20 @@ jobs:
       - name: Configure nginx edge
         run: |
           set -euo pipefail
-          DIST="$GITHUB_WORKSPACE/artex/server/webui/dist"
-          test -d "$DIST" || { echo "dist 不存在: $DIST" >&2; exit 1; }
+          SRC="$GITHUB_WORKSPACE/artex/server/webui/dist"
+          test -d "$SRC" || { echo "dist 不存在: $SRC" >&2; exit 1; }
+          # 关键：nginx 以 www-data 运行，无法穿越 /home/runner/work（other 无 x 位），
+          # 必须把静态文件放到它读得到的地方。
+          DIST=/var/www/artex
+          sudo rm -rf "$DIST"
+          sudo mkdir -p "$DIST"
+          sudo cp -a "$SRC/." "$DIST/"
+          sudo chown -R www-data:www-data "$DIST"
+          sudo find "$DIST" -type d -exec chmod 755 {} +
+          sudo find "$DIST" -type f -exec chmod 644 {} +
+          test -f "$DIST/index.html" || { echo "复制后缺少 index.html" >&2; exit 1; }
+          echo "静态资源已就位: $(find "$DIST" -type f | wc -l) 个文件, $(du -sh "$DIST" | cut -f1)"
+          echo "gzip 副本: $(find "$DIST" -name '*.gz' | wc -l) 个"
           sudo tee /etc/nginx/sites-available/artex >/dev/null <<EOF
           map \$http_accept_encoding \$gz_ok {
               default 0;
@@ -278,7 +290,7 @@ jobs:
               location /_next/static/ {
                   add_header Cache-Control "public, max-age=31536000, immutable" always;
                   access_log off;
-                  try_files \$uri =404;
+                  try_files \$uri @backend;
               }
               location /_next/image/ {
                   add_header Cache-Control "public, max-age=86400" always;
@@ -306,10 +318,21 @@ jobs:
                   gzip_proxied any;
               }
 
-              # 页面：短缓存，兼顾刷新即时性与减少往返
+              # 页面：短缓存；找不到就回退给 Go（Go 内嵌了同一份前端，保证不裸 500）
               location / {
                   add_header Cache-Control "public, max-age=60" always;
-                  try_files \$uri \$uri/ \$uri/index.html /index.html;
+                  try_files \$uri \$uri/ \$uri/index.html @backend;
+              }
+
+              # 兜底：静态找不到时交给 Go 处理（内嵌前端 + 各页路由）
+              location @backend {
+                  proxy_pass http://127.0.0.1:8787;
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_read_timeout 600s;
               }
           }
           EOF
