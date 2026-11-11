@@ -116,7 +116,7 @@ git push -u origin main
 
 # 公网验证（frps 所在网络或任意外网）
 curl -sS -o /dev/null -w '%{http_code}\n' http://203.195.195.52:18087/
-curl -sS http://203.195.195.52:18087/api/health
+curl -sS http://20387/api/health
 ```
 
 Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址；
