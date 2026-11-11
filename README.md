@@ -2,7 +2,7 @@
 
 目标：在 **Janit8r/hihaff** 仓库上用 GitHub Actions 从源码构建并运行
 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（Go 后端 + Next 静态前端），
-再用 **frpc** 把 Web 端口反代到公网 frps **203.195.195.52:7023**。
+再用 **frpc** 把 Web 端口反代到公网 frps **203**。
 
 ## 0. 架构
 
@@ -150,7 +150,7 @@ GitHub 托管 runner **是临时的**，单个 job 最长 6 小时，结束即�
 
 ## 7. 常驻部署（可选，去掉空窗）
 
-同一个二进制，扔到你的常驻主机（例如 203.195.195.52 自己）跑：
+同一个二进制，扔到你的常驻主机（例如 202 自己）跑：
 
 ```bash
 # 本地产物：/tmp/artex-bin（或用 Actions 上传的 artifact）
