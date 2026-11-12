@@ -43,7 +43,7 @@ runner 是临时的，`postgres` 作为 service 容器随 job 销毁，所以默
 ```
 本轮结束前                      下一轮开始
 pg_dump → .artex-state/db.sql.gz   actions/cache/restore
-tar data → .artex-state/data.tgz    →  psql 恢复
+tar data → .artex-state/data.tgz    →  psql 恢复（失败即中止，不用空库覆盖）
       ↓                                  ↓
 actions/cache/save                 artex -data .artex-state/data
 ```
@@ -53,16 +53,44 @@ actions/cache/save                 artex -data .artex-state/data
 | `STATE_DIR` | `$GITHUB_WORKSPACE/.artex-state`，缓存路径 |
 | 缓存 key | `artex-state-<run_id>-mid` / `-final`，唯一不覆盖 |
 | 恢复方式 | `restore-keys: artex-state-` 前缀匹配，取**最近一次** |
-| `-data` 指向 | `${STATE_DIR}/data`，ARTEX 自身数据也随缓存走 |
+| `-data` 指向 | `${STATE_DIR}/data`，ARTEX 自身数据也随缓存走；`data/` 缺失时从 `data.tgz` 兜底还原 |
 | 段间快照 | 值守拆两段（各 50 分钟），中间存一次，被取消也只丢 ≤50 分钟 |
-| 整轮时长 | ≈110 分钟 < cron 的 2 小时 → **正常结束**，缓存后置步骤才会执行 |
+| 取消时抢救 | 收尾快照与保存改成 `if: always()`，被下一轮顶掉时仍会写一次缓存 |
+| 整轮时长 | ≈110 分钟 < cron 的 2 小时 → **正常结束** |
+| 缓存保留 | 最近 12 份 + 本轮实际恢复的那一份（永不淘汰，作为可回滚的已知好快照） |
 
-> 之前每轮数据丢失的根因：cron 每 2 小时 + `cancel-in-progress: true`，
-> 而 job 值守 5h40m，于是每轮都在 2 小时处被**取消**，
-> `actions/cache` 的后置保存步骤不会在取消时运行。
+#### 为什么之前「每轮都是新数据」—— 已修复
 
-想验证持久化是否生效：job Summary 里看「跨轮持久化」块的恢复来源与状态目录内容；
-连跑两轮，第二轮应显示 `恢复来源: artex-state-<上一轮run_id>-final`。
+实测日志（run `43150501982`）：缓存其实**每次都命中了**，但数据库恢复失败，
+而旧代码把失败降级成「继续用空库启动，不影响上线」，于是看起来像没做持久化；
+更糟的是 50 分钟后的段间快照会把这个空库写回缓存，**把上一轮数据永久覆盖掉**。
+
+```
+ERROR:  unrecognized configuration parameter "transaction_timeout"
+恢复失败（继续用空库启动，不影响上线）：
+```
+
+根因是 **pg_dump / 服务端版本错配**：runner 现在跑 ubuntu-26.04，自带 `pg_dump 18.6`，
+dump 头会写 `SET transaction_timeout = 0;`（PG18 新增的 GUC），而 service 是
+`postgres:16-alpine` —— 服务端不认识，`psql -v ON_ERROR_STOP=1` 在第 4 行就中断。
+
+现在的处理：
+
+1. 导出时直接过滤 PG18 专有的 `transaction_timeout`，写进缓存的快照在 PG16 上可直接导入；
+2. 恢复时若仍遇到「未知 GUC」，自动解析报错参数、加入过滤表、重置 `public` schema 后重试（最多 6 轮）；
+3. 恢复后校验 `public` 表数量不少于 dump 里的 `CREATE TABLE` 数，确认真的恢复了；
+4. **任何恢复失败都直接中止 job**，绝不用空库继续跑、绝不覆盖上一份好快照；
+5. 快照脚本加 `pipefail` + `gzip -t` 校验 + 原子 `mv`，导出失败一律保留旧快照
+   （旧版没有 `pipefail`，`pg_dump` 挂了也可能被当成成功而写入截断的 dump）。
+
+#### 验证与回滚
+
+job Summary 的「跨轮持久化」块会显示 `恢复来源`、`数据库恢复: true` 和 `public 表数量`；
+连跑两轮，第二轮应显示 `恢复来源: artex-state-<上一轮run_id>-final`，且表数量与上一轮一致。
+
+某一轮产生了坏快照时，Actions → **Run workflow** → 填 `state_cache_key`
+（例如 `artex-state-43150501982-final`）即可强制回到任意历史快照；
+留空则自动取最近一次。也可以在 Summary 里看缓存 key 列表。
 
 ARTEX 关键事实（已核对源码）：
 
@@ -198,7 +226,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://203.195.195.52:18087/
 curl -sS http://203.195.195.52:18087/api/health
 ```
 
-Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址与凭据来源（Environment secrets）；
+Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址与凭据来源（Environment secrets），
+以及「跨轮持久化」块的恢复来源 / 数据库恢复状态 / public 表数量；
 `Wait for health`、`Start frpc`、`Keep alive` 三步的日志里能看到探活与 frp 握手结果。
 
 ## 5. 为什么需要 cron + keep-alive
@@ -229,7 +258,11 @@ GitHub 托管 runner **是临时的**，单个 job 最长 6 小时，结束即�
 | frpc 日志 `port already used` | `remotePort` 被占或被 `allowPorts` 拒 | 换 `FRP_REMOTE_PORT` 或扩大 `allowPorts` |
 | 公网 502/超时但 job 正常 | 安全组未放行 `18087` | 云控制台放行 + 主机防火墙 |
 | 前端白屏 | 未用 `embedui` 构建 | 确认 `Sync frontend` 与 `-tags embedui` 都执行了 |
-| 每 6 小时短暂 404 | runner 切换空窗 | 属预期；见第 5、7 节 |
+| 每 2 小时短暂 404 | runner 切换空窗 | 属预期；见第 5、7 节 |
+| 每轮都是新数据 / Summary 显示 `数据库恢复: false` | 恢复失败或首轮无快照 | 看 `Restore database from snapshot` 日志；确认 `public 表数量` 与上一轮一致 |
+| 日志 `unrecognized configuration parameter "transaction_timeout"` | pg_dump 18 导出的 dump 头含 PG18 专有 GUC，PG16 服务端不认 | 工作流已自动过滤并重试；若仍失败，把 service 镜像升到 `postgres:18-alpine` 或看下一行 |
+| `::error::数据库快照恢复失败，本轮中止` | 快照损坏 / 版本差异过大，工作流故意中止以免覆盖好数据 | 用 Run workflow 的 `state_cache_key` 指定更早的快照；必要时删掉那份坏缓存 |
+| Summary 里 `public 表数量: 0` | 恢复被跳过（无快照）或恢复了空库 | 检查缓存是否命中、dump 是否非空；坏快照用 `state_cache_key` 回滚 |
 
 ## 7. 常驻部署（可选，去掉空窗）
 

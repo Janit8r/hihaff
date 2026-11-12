@@ -6,6 +6,12 @@ name: artex-deploy-frp
 
 on:
   workflow_dispatch:
+    inputs:
+      state_cache_key:
+        description: "可选：强制从指定快照恢复（例如 artex-state-43150501982-final）；留空自动取最近一次"
+        required: false
+        default: ""
+        type: string
   schedule:
     # 关键：job 寿命约 6h，排班必须比寿命更密，否则两轮之间必留空窗。
     # 之前用 0 */6 出现过「19:27 起跑、01:09 结束、下一班 06:00」的 5 小时断线。
@@ -227,52 +233,106 @@ jobs:
       # ---------- 5. 跨轮状态恢复 ----------
       # 缓存 key 用 run_id 保证唯一，restore-keys 前缀匹配「最近一次」的快照，
       # 这样就实现了「上一轮的数据拿来这一轮直接用」。
+      # 手工触发时可指定 state_cache_key 回滚到某个更早的快照。
       - name: Restore state cache
         id: state-restore
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.artex-state
-          key: artex-state-${{ github.run_id }}
+          key: ${{ inputs.state_cache_key || format('artex-state-{0}', github.run_id) }}
           restore-keys: |
             artex-state-
           enableCrossOsArchive: false
 
-      - name: Inspect restored state
+      - name: Restore state files
         run: |
-          set -eu
+          set -euo pipefail
           echo "缓存命中: ${{ steps.state-restore.outputs.cache-matched-key || '<无>' }}"
-          if [ -d "${STATE_DIR}" ]; then
-            du -sh "${STATE_DIR}" 2>/dev/null || true
-            ls -lh "${STATE_DIR}" 2>/dev/null || true
-          else
-            echo "首轮运行：没有可恢复的状态"
+          mkdir -p "${STATE_DIR}"
+          # 缓存里同时存了 data/ 与 data.tgz；data/ 缺失时用 tgz 兜底还原，
+          # 避免「缓存只恢复了压缩包」这种半残状态。
+          if [ ! -d "${STATE_DIR}/data" ] || [ -z "$(ls -A "${STATE_DIR}/data" 2>/dev/null)" ]; then
+            if [ -s "${STATE_DIR}/data.tgz" ]; then
+              tar -xzf "${STATE_DIR}/data.tgz" -C "${STATE_DIR}"
+              echo "data/ 缺失，已从 data.tgz 还原"
+            else
+              mkdir -p "${STATE_DIR}/data"
+              echo "首轮运行：没有可恢复的数据目录"
+            fi
           fi
+          echo "----- 状态目录 -----"
+          du -sh "${STATE_DIR}" 2>/dev/null || true
+          ls -lh "${STATE_DIR}" 2>/dev/null || true
+          echo "data/ 文件数: $(find "${STATE_DIR}/data" -type f 2>/dev/null | wc -l)"
 
       - name: Restore database from snapshot
         run: |
-          set -eu
+          set -euo pipefail
           DUMP="${STATE_DIR}/db.sql.gz"
-          mkdir -p "${STATE_DIR}"
           if [ ! -s "${DUMP}" ]; then
-            echo "没有数据库快照，按全新数据库启动"
+            echo "首轮运行：没有数据库快照，按全新数据库启动"
+            echo "STATE_DB_RESTORED=false" >> "$GITHUB_ENV"
+            echo "STATE_DB_TABLES=0" >> "$GITHUB_ENV"
             exit 0
           fi
           echo "快照大小: $(du -h "${DUMP}" | cut -f1)"
-          command -v pg_restore >/dev/null 2>&1 || command -v psql >/dev/null 2>&1 || \
-            sudo apt-get install -y -qq postgresql-client >/dev/null
-          # 等 postgres service 真正可连接
+          command -v psql >/dev/null 2>&1 || sudo apt-get install -y -qq postgresql-client >/dev/null
           for i in $(seq 1 30); do
             pg_isready -h 127.0.0.1 -p 5432 -U artex -d artex >/dev/null 2>&1 && break
             sleep 2
           done
-          if gunzip -c "${DUMP}" | psql "${ARTEX_PG_DSN}" -v ON_ERROR_STOP=1 -q > /tmp/restore.log 2>&1; then
-            echo "数据库已从快照恢复"
-            psql "${ARTEX_PG_DSN}" -tAc "select count(*) from information_schema.tables where table_schema='public'" \
-              | xargs -I{} echo "public schema 表数量: {}"
-          else
-            echo "恢复失败（继续用空库启动，不影响上线）：" >&2
-            tail -30 /tmp/restore.log >&2
+          pg_isready -h 127.0.0.1 -p 5432 -U artex -d artex >/dev/null 2>&1 \
+            || { echo "::error::PostgreSQL 未就绪，无法恢复快照" >&2; exit 1; }
+
+          # 版本兼容（这是「每轮都是新数据」的根因）：
+          # runner 是 ubuntu-26.04，自带 pg_dump/psql 18，dump 头会写
+          #   SET transaction_timeout = 0;
+          # 而 service 是 postgres:16，服务端不认识这个 PG18 才有的 GUC，
+          # psql -v ON_ERROR_STOP=1 在第 4 行就中断 → 恢复失败却继续用空库启动，
+          # 段间快照又把这份空库写回缓存，等于把上一轮数据永久覆盖掉。
+          # 策略：遇到「未知 GUC」就把该 SET 过滤掉、重置 public schema 后重试，
+          # 最多 6 轮；任何真正失败的恢复都直接中止 job，绝不用空库继续跑。
+          reset_db() {
+            psql "${ARTEX_PG_DSN}" -v ON_ERROR_STOP=1 -q \
+              -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;' >/dev/null 2>&1
+          }
+          : > /tmp/dump-filter.sed
+          ok=0
+          for attempt in 1 2 3 4 5 6; do
+            reset_db || { echo "::error::无法重置 public schema" >&2; exit 1; }
+            if gunzip -c "${DUMP}" \
+               | sed -E -f /tmp/dump-filter.sed \
+               | psql "${ARTEX_PG_DSN}" -v ON_ERROR_STOP=1 -q > /tmp/restore.log 2>&1; then
+              ok=1
+              break
+            fi
+            param=$(grep -oE 'unrecognized configuration parameter "[^"]+"' /tmp/restore.log \
+                    | head -1 | sed -E 's/.*"([^"]+)"/\1/' || true)
+            if [ -z "${param}" ]; then
+              echo "恢复失败（非版本兼容问题）：" >&2
+              tail -30 /tmp/restore.log >&2
+              break
+            fi
+            echo "服务端不认识 SET ${param}，过滤后重试（第 ${attempt} 次）"
+            printf '/^SET[[:space:]]+%s[[:space:]]*=/d\n' "${param}" >> /tmp/dump-filter.sed
+          done
+          if [ "${ok}" -ne 1 ]; then
+            echo "::error::数据库快照恢复失败，本轮中止；不会用空库覆盖上一轮快照。" >&2
+            echo "       快照来源：${{ steps.state-restore.outputs.cache-matched-key || '无' }}" >&2
+            echo "       可用 workflow_dispatch 的 state_cache_key 指定更早的快照重试。" >&2
+            exit 1
           fi
+
+          tables=$(psql "${ARTEX_PG_DSN}" -tAc \
+            "select count(*) from information_schema.tables where table_schema='public'" | tr -d ' ')
+          expected=$(gunzip -c "${DUMP}" | grep -c '^CREATE TABLE ' || true)
+          echo "数据库已从快照恢复：public schema 表数量=${tables}（dump 内 CREATE TABLE=${expected}）"
+          if [ "${tables}" -lt "${expected:-0}" ]; then
+            echo "::error::恢复不完整：实际表数 ${tables} < dump 中 ${expected}" >&2
+            exit 1
+          fi
+          echo "STATE_DB_RESTORED=true" >> "$GITHUB_ENV"
+          echo "STATE_DB_TABLES=${tables}" >> "$GITHUB_ENV"
 
       # ---------- 6. 起服务 ----------
       - name: Start artex
@@ -552,20 +612,44 @@ jobs:
           cat > /tmp/snapshot.sh <<'SCRIPT'
           #!/usr/bin/env bash
           # 把数据库与 ARTEX 数据目录落盘到 STATE_DIR，供缓存步骤打包。
-          set +e
+          # 铁律：任何一步失败 / 校验不过，都绝不覆盖上一份好快照。
+          set -uo pipefail
           mkdir -p "${STATE_DIR}"
-          if pg_dump --no-owner --no-privileges "${ARTEX_PG_DSN}" 2>/tmp/pgdump.err | gzip -6 > "${STATE_DIR}/db.sql.gz.part"; then
-            mv -f "${STATE_DIR}/db.sql.gz.part" "${STATE_DIR}/db.sql.gz"
-            echo "数据库快照: $(du -h "${STATE_DIR}/db.sql.gz" | cut -f1)"
+          rm -f "${STATE_DIR}/db.sql.gz.part" "${STATE_DIR}/data.tgz.part"
+
+          tables=$(psql "${ARTEX_PG_DSN}" -tAc \
+            "select count(*) from information_schema.tables where table_schema='public'" 2>/dev/null | tr -d ' ')
+          if [ "${tables:-0}" -gt 0 ]; then
+            # 不用 --clean：DROP EXTENSION 之类需要超级用户权限，容易把导出搞挂；
+            # 幂等性由恢复侧的 reset_db 保证。过滤 PG18 专有 GUC，
+            # 让写进缓存的快照在 postgres:16 上能被直接恢复，不用等重试。
+            if pg_dump --no-owner --no-privileges "${ARTEX_PG_DSN}" 2>/tmp/pgdump.err \
+               | sed -E '/^SET[[:space:]]+transaction_timeout[[:space:]]*=/d' \
+               | gzip -6 > "${STATE_DIR}/db.sql.gz.part"; then
+              if gzip -t "${STATE_DIR}/db.sql.gz.part" 2>/dev/null && [ -s "${STATE_DIR}/db.sql.gz.part" ]; then
+                mv -f "${STATE_DIR}/db.sql.gz.part" "${STATE_DIR}/db.sql.gz"
+                echo "数据库快照: $(du -h "${STATE_DIR}/db.sql.gz" | cut -f1)（public 表 ${tables}）"
+              else
+                echo "数据库快照校验失败，保留上一份" >&2
+                rm -f "${STATE_DIR}/db.sql.gz.part"
+              fi
+            else
+              echo "pg_dump 失败，保留上一份:" >&2
+              tail -5 /tmp/pgdump.err >&2
+              rm -f "${STATE_DIR}/db.sql.gz.part"
+            fi
           else
-            rm -f "${STATE_DIR}/db.sql.gz.part"
-            echo "数据库快照失败（保留上一份）:" >&2
-            tail -5 /tmp/pgdump.err >&2
+            echo "数据库无表或不可连接，跳过数据库快照，保留上一份" >&2
           fi
+
           if [ -d "${STATE_DIR}/data" ]; then
-            tar -czf "${STATE_DIR}/data.tgz.part" -C "${STATE_DIR}" data 2>/dev/null \
-              && mv -f "${STATE_DIR}/data.tgz.part" "${STATE_DIR}/data.tgz"
-            echo "数据目录快照: $(du -h "${STATE_DIR}/data.tgz" 2>/dev/null | cut -f1)"
+            if tar -czf "${STATE_DIR}/data.tgz.part" -C "${STATE_DIR}" data 2>/dev/null; then
+              mv -f "${STATE_DIR}/data.tgz.part" "${STATE_DIR}/data.tgz"
+              echo "数据目录快照: $(du -h "${STATE_DIR}/data.tgz" | cut -f1)"
+            else
+              echo "数据目录打包失败，保留上一份" >&2
+              rm -f "${STATE_DIR}/data.tgz.part"
+            fi
           fi
           du -sh "${STATE_DIR}" 2>/dev/null
           SCRIPT
@@ -593,13 +677,14 @@ jobs:
         if: success()
         run: bash /tmp/keepalive.sh 3000
 
-      # 收尾快照：本轮正常结束前再存一次，供下一次 cron 恢复
+      # 收尾快照：用 always()，这样被下一轮 concurrency 取消时也能把数据抢救进缓存
       - name: Snapshot state (final)
-        if: success()
+        if: always()
+        continue-on-error: true
         run: bash /tmp/snapshot.sh
 
       - name: Save state cache (final)
-        if: success()
+        if: always()
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -613,6 +698,7 @@ jobs:
             echo "### 跨轮持久化"
             echo ""
             echo "- 恢复来源：${{ steps.state-restore.outputs.cache-matched-key || '首轮（无缓存）' }}"
+            echo "- 数据库恢复：\`${{ env.STATE_DB_RESTORED || '未执行' }}\`，public 表数量：\`${{ env.STATE_DB_TABLES || '0' }}\`"
             echo "- 本轮保存 key：\`artex-state-${{ github.run_id }}-mid\` / \`artex-state-${{ github.run_id }}-final\`"
             echo "- 状态目录内容："
             echo '```'
@@ -620,7 +706,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 仓库缓存配额 10GB，状态快照会不断累积，只保留最近 4 份
+      # 仓库缓存配额 10GB，状态快照会不断累积，保留最近 12 份；
+      # 另外永远保留本轮实际恢复的那一份，作为可回滚的已知好快照。
       - name: Prune old state caches
         if: always()
         continue-on-error: true
@@ -632,11 +719,16 @@ jobs:
           list=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
                       -H "Accept: application/vnd.github+json" \
                       "${api}?per_page=100")
-          # 只处理 artex-state-*，按创建时间倒序，保留最新 4 份
+          # 只处理 artex-state-*，按创建时间倒序，保留最新 12 份
+          # 本轮恢复用的那份不参与淘汰，避免「坏快照把好快照挤掉」
+          keep='${{ steps.state-restore.outputs.cache-matched-key }}'
           echo "$list" \
-            | jq -r '.actions_caches[] | select(.key|startswith("artex-state-")) | "\(.created_at)\t\(.id)\t\(.key)"' \
+            | jq -r --arg keep "$keep" '.actions_caches[]
+                | select(.key|startswith("artex-state-"))
+                | select(.key != $keep)
+                | "\(.created_at)\t\(.id)\t\(.key)"' \
             | sort -r \
-            | tail -n +5 \
+            | tail -n +13 \
             | while IFS="$(printf '\t')" read -r created id key; do
                 [ -n "${id:-}" ] || continue
                 echo "删除旧快照: ${key} (${created})"
