@@ -13,10 +13,13 @@ on:
         default: ""
         type: string
   schedule:
-    # 关键：job 寿命约 6h，排班必须比寿命更密，否则两轮之间必留空窗。
-    # 之前用 0 */6 出现过「19:27 起跑、01:09 结束、下一班 06:00」的 5 小时断线。
-    # 现在每 2 小时拉一轮，cancel-in-progress 顶掉旧轮 → 任何时刻都有活跃隧道。
-    - cron: "0 */2 * * *"
+    # 关键 1：绝对不要排在整点。GitHub 文档明确说「每小时开始是高峰期」，
+    #   整点 schedule 会被延迟甚至整班丢弃。实测 0 */2 的两班分别延迟 87/71 分钟，
+    #   10:00Z 那一班直接被 drop，造成 1~2 小时断线。改到第 17 分错峰。
+    # 关键 2：job 寿命(~5h33m) 远大于 cron 间隔(2h)，配合 cancel-in-progress
+    #   形成「滚动续期」：新一轮起来才顶掉旧轮；即使漏掉一两班，旧轮仍在服务。
+    # cron 用 UTC；*/2 的第 17 分 = 北京时间偶数点的 17 分。
+    - cron: "17 */2 * * *"
   push:
     branches: [main]
     paths:
@@ -62,9 +65,12 @@ jobs:
     # 不要给这个 Environment 加 required reviewers / wait timer，
     # 否则 cron 触发的无人值守轮次会卡在等待审批，隧道直接断线。
     environment: production
-    # 值守拆成两段（各 ~50 分钟），中间存一次快照；整轮约 110 分钟，
-    # 必须短于 cron 的 2 小时，否则每轮都会被下一轮取消，缓存后置步骤就不会执行。
-    timeout-minutes: 150
+    # 值守 30min + 300min = 330 分钟（~5h30m），加构建 ≈5h33m，
+    # 故意远大于 cron 的 2 小时间隔：让旧轮在下一轮就绪前一直顶着，漏班也不断线。
+    # 每轮通常被下一轮 concurrency 取消，所以数据保存不依赖「正常结束」，
+    # 而是靠：30 分钟处一次显式缓存保存 + 每 10 分钟本地快照 + if: always() 收尾抢救。
+    # 350 分钟留余量（GitHub 托管 runner 单 job 硬上限 6 小时）。
+    timeout-minutes: 350
 
     services:
       postgres:
@@ -599,9 +605,14 @@ jobs:
               nohup frpc -c /tmp/frpc.toml >> /tmp/frpc.stdout 2>&1 &
               sleep 10
             fi
+            # 每 20 次循环 = 10 分钟：心跳 + 本地快照。
+            # job 现在多数是被下一轮 cancel 掉的（不再「正常结束」），
+            # 所以必须让 STATE_DIR 始终是最近 10 分钟内的状态，
+            # 收尾的 if: always() 步骤才能把接近最新的数据抢救进缓存。
             if [ $((n % 20)) -eq 0 ]; then
               ok=$(curl -fsS -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${EDGE_PORT}/" || echo 000)
-              echo "[$(date +%T)] 心跳 #${n} edge_http=${ok} frp=$(pgrep -fc 'frpc -c /tmp/frpc.toml') db=$(du -sh "${STATE_DIR}" 2>/dev/null | cut -f1)"
+              bash /tmp/snapshot.sh > /tmp/snapshot-periodic.log 2>&1 || true
+              echo "[$(date +%T)] 心跳 #${n} edge_http=${ok} frp=$(pgrep -fc 'frpc -c /tmp/frpc.toml') db=$(du -sh "${STATE_DIR}" 2>/dev/null | cut -f1) snap=$(stat -c %y "${STATE_DIR}/db.sql.gz" 2>/dev/null | cut -d. -f1 || echo none)"
             fi
             sleep 30
           done
@@ -656,9 +667,11 @@ jobs:
           chmod +x /tmp/snapshot.sh
           echo "辅助脚本就绪"
 
-      - name: Keep alive segment 1 (50 min)
+      # 第一段只跑 30 分钟就先存一份缓存：本轮多半会在 ~120 分钟处被下一轮取消，
+      # 必须尽早有一个「已经进缓存」的可靠检查点。
+      - name: Keep alive segment 1 (30 min)
         if: success()
-        run: bash /tmp/keepalive.sh 3000
+        run: bash /tmp/keepalive.sh 1800
 
       # 段间快照：即使本轮后面被下一轮取消，这份数据也已经进缓存
       - name: Snapshot state (mid-run)
@@ -673,9 +686,11 @@ jobs:
           path: ${{ github.workspace }}/.artex-state
           key: artex-state-${{ github.run_id }}-mid
 
-      - name: Keep alive segment 2 (50 min)
+      # 第二段 300 分钟，把「漏班容忍度」撑到 5 个多小时；
+      # 正常情况下会在 ~120 分钟处被下一轮 cancel，这段只是兜底寿命。
+      - name: Keep alive segment 2 (300 min)
         if: success()
-        run: bash /tmp/keepalive.sh 3000
+        run: bash /tmp/keepalive.sh 18000
 
       # 收尾快照：用 always()，这样被下一轮 concurrency 取消时也能把数据抢救进缓存
       - name: Snapshot state (final)
