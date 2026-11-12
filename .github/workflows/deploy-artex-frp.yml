@@ -19,6 +19,8 @@ on:
 
 permissions:
   contents: read
+  # 用于清理旧的状态快照缓存，避免仓库缓存配额被慢慢占满
+  actions: write
 
 concurrency:
   group: artex-frp
@@ -596,6 +598,35 @@ jobs:
             ls -lh "${STATE_DIR}" 2>/dev/null || echo "(空)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 仓库缓存配额 10GB，状态快照会不断累积，只保留最近 4 份
+      - name: Prune old state caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/caches"
+          list=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+                      -H "Accept: application/vnd.github+json" \
+                      "${api}?per_page=100")
+          # 只处理 artex-state-*，按创建时间倒序，保留最新 4 份
+          echo "$list" \
+            | jq -r '.actions_caches[] | select(.key|startswith("artex-state-")) | "\(.created_at)\t\(.id)\t\(.key)"' \
+            | sort -r \
+            | tail -n +5 \
+            | while IFS="$(printf '\t')" read -r created id key; do
+                [ -n "${id:-}" ] || continue
+                echo "删除旧快照: ${key} (${created})"
+                curl -sS -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
+                     -H "Accept: application/vnd.github+json" "${api}/${id}" || true
+              done
+          echo "剩余 artex-state 快照："
+          curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/vnd.github+json" "${api}?per_page=100" \
+            | jq -r '[.actions_caches[] | select(.key|startswith("artex-state-"))] | length' \
+            | xargs -I{} echo "  {} 份"
 
       - name: Dump logs
         if: always()
