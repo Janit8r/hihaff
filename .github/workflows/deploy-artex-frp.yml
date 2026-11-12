@@ -273,6 +273,16 @@ jobs:
               root ${DIST};
               index index.html;
 
+              # 关键：nginx 监听 EDGE_PORT(8080)，但公网经 frp 映射到 FRP_REMOTE_PORT(18087)。
+              # 默认行为下，目录补斜杠的重定向会拼成绝对 URL 并带上 8080，
+              # 浏览器于是跳到 http://host:8080/...（公网不可达）。
+              # 关闭绝对重定向，只发相对路径，端口由客户端自行保持。
+              absolute_redirect off;
+              server_name_in_redirect off;
+              port_in_redirect off;
+              # 后端若返回绝对重定向，原样透传，不要改写成 127.0.0.1:8787
+              proxy_redirect off;
+
               # 隧道带宽极小，尽量把压缩与缓存做到极致
               gzip on;
               gzip_static on;
@@ -309,10 +319,11 @@ jobs:
                   proxy_pass http://127.0.0.1:8787;
                   proxy_http_version 1.1;
                   proxy_set_header Connection "";
-                  proxy_set_header Host \$host;
+                  proxy_set_header Host \$http_host;
                   proxy_set_header X-Real-IP \$remote_addr;
                   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
                   proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_set_header X-Forwarded-Host \$http_host;
                   proxy_buffering on;
                   proxy_read_timeout 600s;
                   proxy_send_timeout 600s;
@@ -331,9 +342,11 @@ jobs:
                   proxy_pass http://127.0.0.1:8787;
                   proxy_http_version 1.1;
                   proxy_set_header Connection "";
-                  proxy_set_header Host \$host;
+                  proxy_set_header Host \$http_host;
                   proxy_set_header X-Real-IP \$remote_addr;
                   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_set_header X-Forwarded-Host \$http_host;
                   proxy_read_timeout 600s;
               }
           }
@@ -369,6 +382,23 @@ jobs:
 
           echo "--- API 透传 ---"
           curl -sS "http://127.0.0.1:${EDGE_PORT}/api/health"; echo
+
+          echo "--- 重定向不得泄露内部端口 ${EDGE_PORT} ---"
+          bad=0
+          for p in /login /chat /_next/static /settings; do
+            loc=$(curl -sS -o /dev/null -D - -H 'Accept: text/html' "http://127.0.0.1:${EDGE_PORT}${p}" \
+                  | grep -i '^location:' | tr -d '\r' || true)
+            echo "  ${p} -> ${loc:-<无重定向>}"
+            case "$loc" in
+              *":${EDGE_PORT}"*) echo "    !! Location 泄露内部端口，公网会跳到不可达地址" >&2; bad=1 ;;
+            esac
+          done
+          if [ "$bad" -eq 0 ]; then
+            echo "重定向检查通过（相对路径或正确端口）"
+          else
+            echo "重定向检查失败" >&2
+            exit 1
+          fi
 
       - name: Start frpc
         run: |
