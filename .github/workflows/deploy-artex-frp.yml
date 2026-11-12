@@ -7,8 +7,10 @@ name: artex-deploy-frp
 on:
   workflow_dispatch:
   schedule:
-    # 每 6 小时续一次；新一轮会取消旧一轮（concurrency），实现近乎连续的在线
-    - cron: "0 */6 * * *"
+    # 关键：job 寿命约 6h，排班必须比寿命更密，否则两轮之间必留空窗。
+    # 之前用 0 */6 出现过「19:27 起跑、01:09 结束、下一班 06:00」的 5 小时断线。
+    # 现在每 2 小时拉一轮，cancel-in-progress 顶掉旧轮 → 任何时刻都有活跃隧道。
+    - cron: "0 */2 * * *"
   push:
     branches: [main]
     paths:
