@@ -37,14 +37,19 @@ env:
   ARTEX_PROXY: "127.0.0.1:8788"
   # nginx 边缘层端口（frpc 暴露的是它，不是 8787）
   EDGE_PORT: "8080"
+  # ---- 跨轮持久化 ----
+  # 这个目录整体进 Actions 缓存：数据库转储 + ARTEX 自身数据目录。
+  # 下一轮先恢复它，再启动 artex，做到「接着上次跑」。
+  STATE_DIR: ${{ github.workspace }}/.artex-state
   NEXT_TELEMETRY_DISABLED: "1"
 
 jobs:
   serve:
     name: build + run + frp tunnel
     runs-on: ubuntu-latest
-    # 单个 job 上限 6h；留 5 分钟余量给收尾
-    timeout-minutes: 355
+    # 值守拆成两段（各 ~50 分钟），中间存一次快照；整轮约 110 分钟，
+    # 必须短于 cron 的 2 小时，否则每轮都会被下一轮取消，缓存后置步骤就不会执行。
+    timeout-minutes: 150
 
     services:
       postgres:
@@ -197,15 +202,66 @@ jobs:
           sed -e 's/^\(auth.token = \).*/\1"***"/' /tmp/frpc.toml
           frpc verify -c /tmp/frpc.toml
 
-      # ---------- 5. 起服务 ----------
+      # ---------- 5. 跨轮状态恢复 ----------
+      # 缓存 key 用 run_id 保证唯一，restore-keys 前缀匹配「最近一次」的快照，
+      # 这样就实现了「上一轮的数据拿来这一轮直接用」。
+      - name: Restore state cache
+        id: state-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.artex-state
+          key: artex-state-${{ github.run_id }}
+          restore-keys: |
+            artex-state-
+          enableCrossOsArchive: false
+
+      - name: Inspect restored state
+        run: |
+          set -eu
+          echo "缓存命中: ${{ steps.state-restore.outputs.cache-matched-key || '<无>' }}"
+          if [ -d "${STATE_DIR}" ]; then
+            du -sh "${STATE_DIR}" 2>/dev/null || true
+            ls -lh "${STATE_DIR}" 2>/dev/null || true
+          else
+            echo "首轮运行：没有可恢复的状态"
+          fi
+
+      - name: Restore database from snapshot
+        run: |
+          set -eu
+          DUMP="${STATE_DIR}/db.sql.gz"
+          mkdir -p "${STATE_DIR}"
+          if [ ! -s "${DUMP}" ]; then
+            echo "没有数据库快照，按全新数据库启动"
+            exit 0
+          fi
+          echo "快照大小: $(du -h "${DUMP}" | cut -f1)"
+          command -v pg_restore >/dev/null 2>&1 || command -v psql >/dev/null 2>&1 || \
+            sudo apt-get install -y -qq postgresql-client >/dev/null
+          # 等 postgres service 真正可连接
+          for i in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5432 -U artex -d artex >/dev/null 2>&1 && break
+            sleep 2
+          done
+          if gunzip -c "${DUMP}" | psql "${ARTEX_PG_DSN}" -v ON_ERROR_STOP=1 -q > /tmp/restore.log 2>&1; then
+            echo "数据库已从快照恢复"
+            psql "${ARTEX_PG_DSN}" -tAc "select count(*) from information_schema.tables where table_schema='public'" \
+              | xargs -I{} echo "public schema 表数量: {}"
+          else
+            echo "恢复失败（继续用空库启动，不影响上线）：" >&2
+            tail -30 /tmp/restore.log >&2
+          fi
+
+      # ---------- 6. 起服务 ----------
       - name: Start artex
         run: |
           set -euo pipefail
-          mkdir -p /tmp/artex-data
+          # -data 指向缓存目录，这样 ARTEX 自己的数据也随缓存跨轮保留
+          mkdir -p "${STATE_DIR}/data"
           nohup /tmp/artex-bin \
             -addr "${ARTEX_ADDR}" \
             -proxy "${ARTEX_PROXY}" \
-            -data /tmp/artex-data \
+            -data "${STATE_DIR}/data" \
             > /tmp/artex.log 2>&1 &
           echo $! > /tmp/artex.pid
 
@@ -424,21 +480,30 @@ jobs:
             echo "- 触发 commit：${{ github.sha }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------- 6. 值守：进程掉线自动拉起，直到 job 时间用尽 ----------
-      - name: Keep alive (auto-restart)
-        # 只有前面全部成功才进入值守；失败时直接走日志步骤暴露问题，不空耗 5 小时
-        if: success()
+      # ---------- 7. 值守：掉线自愈；拆成两段，段间存快照 ----------
+      - name: Write keepalive + snapshot helpers
         run: |
+          set -euo pipefail
+          # 快照要用 pg_dump；runner 镜像通常自带，缺失就装
+          if ! command -v pg_dump >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client >/dev/null
+          fi
+          pg_dump --version
+          cat > /tmp/keepalive.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # 用法: keepalive.sh <秒数>
           set +e
-          deadline=$(( $(date +%s) + 20400 ))   # ~5h40m
-          echo "值守开始，截止 $(date -d @${deadline} '+%F %T %Z' 2>/dev/null || echo $deadline)"
+          dur="${1:-3000}"
+          deadline=$(( $(date +%s) + dur ))
+          echo "值守开始 ${dur}s，截止 $(date -d "@${deadline}" '+%F %T %Z' 2>/dev/null || echo "$deadline")"
           n=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
             n=$((n+1))
             if ! pgrep -f '/tmp/artex-bin' >/dev/null 2>&1; then
               echo "[$(date +%T)] artex 掉线 → 重启"
               nohup /tmp/artex-bin -addr "${ARTEX_ADDR}" -proxy "${ARTEX_PROXY}" \
-                -data /tmp/artex-data >> /tmp/artex.log 2>&1 &
+                -data "${STATE_DIR}/data" >> /tmp/artex.log 2>&1 &
               sleep 15
             fi
             if ! pgrep -f 'nginx: master' >/dev/null 2>&1; then
@@ -453,11 +518,84 @@ jobs:
             fi
             if [ $((n % 20)) -eq 0 ]; then
               ok=$(curl -fsS -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${EDGE_PORT}/" || echo 000)
-              echo "[$(date +%T)] 心跳 #${n} edge_http=${ok} frp=$(pgrep -fc 'frpc -c /tmp/frpc.toml')"
+              echo "[$(date +%T)] 心跳 #${n} edge_http=${ok} frp=$(pgrep -fc 'frpc -c /tmp/frpc.toml') db=$(du -sh "${STATE_DIR}" 2>/dev/null | cut -f1)"
             fi
             sleep 30
           done
-          echo "值守窗口结束，交给下一次 cron 续接"
+          echo "本段值守结束"
+          SCRIPT
+          chmod +x /tmp/keepalive.sh
+
+          cat > /tmp/snapshot.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # 把数据库与 ARTEX 数据目录落盘到 STATE_DIR，供缓存步骤打包。
+          set +e
+          mkdir -p "${STATE_DIR}"
+          if pg_dump --no-owner --no-privileges "${ARTEX_PG_DSN}" 2>/tmp/pgdump.err | gzip -6 > "${STATE_DIR}/db.sql.gz.part"; then
+            mv -f "${STATE_DIR}/db.sql.gz.part" "${STATE_DIR}/db.sql.gz"
+            echo "数据库快照: $(du -h "${STATE_DIR}/db.sql.gz" | cut -f1)"
+          else
+            rm -f "${STATE_DIR}/db.sql.gz.part"
+            echo "数据库快照失败（保留上一份）:" >&2
+            tail -5 /tmp/pgdump.err >&2
+          fi
+          if [ -d "${STATE_DIR}/data" ]; then
+            tar -czf "${STATE_DIR}/data.tgz.part" -C "${STATE_DIR}" data 2>/dev/null \
+              && mv -f "${STATE_DIR}/data.tgz.part" "${STATE_DIR}/data.tgz"
+            echo "数据目录快照: $(du -h "${STATE_DIR}/data.tgz" 2>/dev/null | cut -f1)"
+          fi
+          du -sh "${STATE_DIR}" 2>/dev/null
+          SCRIPT
+          chmod +x /tmp/snapshot.sh
+          echo "辅助脚本就绪"
+
+      - name: Keep alive segment 1 (50 min)
+        if: success()
+        run: bash /tmp/keepalive.sh 3000
+
+      # 段间快照：即使本轮后面被下一轮取消，这份数据也已经进缓存
+      - name: Snapshot state (mid-run)
+        if: success()
+        run: bash /tmp/snapshot.sh
+
+      - name: Save state cache (mid-run)
+        if: success()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.artex-state
+          key: artex-state-${{ github.run_id }}-mid
+
+      - name: Keep alive segment 2 (50 min)
+        if: success()
+        run: bash /tmp/keepalive.sh 3000
+
+      # 收尾快照：本轮正常结束前再存一次，供下一次 cron 恢复
+      - name: Snapshot state (final)
+        if: success()
+        run: bash /tmp/snapshot.sh
+
+      - name: Save state cache (final)
+        if: success()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.artex-state
+          key: artex-state-${{ github.run_id }}-final
+
+      - name: Persistence summary
+        if: always()
+        run: |
+          {
+            echo "### 跨轮持久化"
+            echo ""
+            echo "- 恢复来源：${{ steps.state-restore.outputs.cache-matched-key || '首轮（无缓存）' }}"
+            echo "- 本轮保存 key：\`artex-state-${{ github.run_id }}-mid\` / \`artex-state-${{ github.run_id }}-final\`"
+            echo "- 状态目录内容："
+            echo '```'
+            ls -lh "${STATE_DIR}" 2>/dev/null || echo "(空)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dump logs
         if: always()

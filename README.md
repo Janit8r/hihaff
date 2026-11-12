@@ -35,6 +35,35 @@ GitHub Actions runner (ubuntu-latest, 临时)
 预期：首屏 ≈80s → **≈30s**；同一浏览器二次访问**接近秒开**。
 再快只能提高链路带宽（frps 规格/线路）或改国内常驻部署。
 
+### 跨轮数据持久化（不用每次重跑）
+
+runner 是临时的，`postgres` 作为 service 容器随 job 销毁，所以默认每轮都是空库。
+解决办法：**把数据库转储 + ARTEX 数据目录放进 Actions 缓存**，下一轮先恢复再启动。
+
+```
+本轮结束前                      下一轮开始
+pg_dump → .artex-state/db.sql.gz   actions/cache/restore
+tar data → .artex-state/data.tgz    →  psql 恢复
+      ↓                                  ↓
+actions/cache/save                 artex -data .artex-state/data
+```
+
+| 关键点 | 说明 |
+|---|---|
+| `STATE_DIR` | `$GITHUB_WORKSPACE/.artex-state`，缓存路径 |
+| 缓存 key | `artex-state-<run_id>-mid` / `-final`，唯一不覆盖 |
+| 恢复方式 | `restore-keys: artex-state-` 前缀匹配，取**最近一次** |
+| `-data` 指向 | `${STATE_DIR}/data`，ARTEX 自身数据也随缓存走 |
+| 段间快照 | 值守拆两段（各 50 分钟），中间存一次，被取消也只丢 ≤50 分钟 |
+| 整轮时长 | ≈110 分钟 < cron 的 2 小时 → **正常结束**，缓存后置步骤才会执行 |
+
+> 之前每轮数据丢失的根因：cron 每 2 小时 + `cancel-in-progress: true`，
+> 而 job 值守 5h40m，于是每轮都在 2 小时处被**取消**，
+> `actions/cache` 的后置保存步骤不会在取消时运行。
+
+想验证持久化是否生效：job Summary 里看「跨轮持久化」块的恢复来源与状态目录内容；
+连跑两轮，第二轮应显示 `恢复来源: artex-state-<上一轮run_id>-final`。
+
 ARTEX 关键事实（已核对源码）：
 
 | 项 | 值 | 来源 |
