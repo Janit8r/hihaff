@@ -12,11 +12,13 @@ log.level = "info"
 # auth.method = "token"
 # auth.token = "YOUR_FRP_TOKEN"
 
+# 注意：工作流里 frpc 暴露的是 nginx 边缘层 8080（不是 artex 的 8787），
+# 这样静态资源走 nginx 的 gzip_static + 长缓存，/api 再由 nginx 反代到 8787。
 [[proxies]]
 name = "artex-web"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = 8787
+localPort = 8080
 remotePort = 18087          # 公网访问 http://203.195.195.52:18087
 
 # ---------------------------------------------------------------
