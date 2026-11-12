@@ -1,15 +1,33 @@
 # frps 服务端配置（放在 203.195.195.52 上）
 # 文件路径示例：/etc/frp/frps.toml  启动：frps -c /etc/frp/frps.toml
+#
+# 安全约定：bindPort 与 auth.token 不写死在仓库里，用 frp 原生的环境变量
+# 模板语法（.Envs 前缀）读取。服务端的变量由 systemd EnvironmentFile 提供，
+# 值必须与 GitHub Environment production 下的两个 secrets 完全一致：
+#   secret FRP_BIND_PORT = 7023
+#   secret FRP_TOKEN     = 同一个强口令
+#
+# 服务端准备（值只落在服务器本地，不进仓库、不进命令行历史）：
+#   sudo tee /etc/frp/frps.env >/dev/null <<'EOF'
+#   FRP_BIND_PORT=7023
+#   FRP_TOKEN=<与 GitHub Environment secret FRP_TOKEN 相同的值>
+#   EOF
+#   sudo chmod 600 /etc/frp/frps.env
+#   sudo systemctl edit frps
+#     [Service]
+#     EnvironmentFile=/etc/frp/frps.env
+#   sudo systemctl daemon-reload && sudo systemctl restart frps
+# 前台试跑也可以：set -a; . /etc/frp/frps.env; set +a; frps -c /etc/frp/frps.toml
 
-bindPort = 7023                 # ← 客户端连接的端口，即你给的 203.195.195.52:7023
-# vhostHTTPPort = 8080         # 若要用域名型 http 反代则放开
+bindPort = {{ .Envs.FRP_BIND_PORT }}
+# vhostHTTPPort = 8080        # 若要用域名型 http 反代则放开
 
 log.to = "/var/log/frps.log"
 log.level = "info"
 log.maxDays = 7
 
 auth.method = "token"
-auth.token = "CHANGE_ME_STRONG_TOKEN"     # 与 GitHub Secret FRP_TOKEN 保持一致
+auth.token = "{{ .Envs.FRP_TOKEN }}"
 
 # 只允许客户端占用这些远程端口（安全）
 allowPorts = [

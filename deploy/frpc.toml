@@ -1,19 +1,35 @@
-# frpc 客户端配置（runner 上由工作流自动生成到 /tmp/frpc.toml）
-# 本文件是同内容的可读版本，方便本地/服务器复用
+# frpc 客户端配置（可读参考版）
+#
+# 工作流实际用的是 .github/workflows/deploy-artex-frp.yml 里
+# "Render frpc.toml" 步骤生成的 /tmp/frpc.toml；其中 serverPort 与 auth.token
+# 的值来自 GitHub Environment production 下的两个 secrets：
+#   FRP_BIND_PORT → frps 的 bindPort（这里是 7023）
+#   FRP_TOKEN     → frps 的 auth.token
+#
+# 本文件用 frp 原生的环境变量模板语法（.Envs 前缀）引用同名变量，
+# 仓库里不保存任何明文口令。本地复用时先导出再启动：
+#   export FRP_BIND_PORT=7023
+#   export FRP_TOKEN='与 frps 一致的强口令'
+#   frpc -c deploy/frpc.toml
+# 在 GitHub Actions 里，这两个变量由 jobs.serve.env 从 Environment secrets 注入。
 
 serverAddr = "203.195.195.52"
-serverPort = 7023
+serverPort = {{ .Envs.FRP_BIND_PORT }}
 loginFailExit = false
 
 log.to = "/tmp/frpc.log"
 log.level = "info"
 
-# frps 若配置了 auth.token，这里必须一致；工作流通过 Secret FRP_TOKEN 注入
-# auth.method = "token"
-# auth.token = "YOUR_FRP_TOKEN"
+auth.method = "token"
+auth.token = "{{ .Envs.FRP_TOKEN }}"
 
-# 注意：工作流里 frpc 暴露的是 nginx 边缘层 8080（不是 artex 的 8787），
-# 这样静态资源走 nginx 的 gzip_static + 长缓存，/api 再由 nginx 反代到 8787。
+# 客户端级 transport 配置，必须写在 proxies 之前（与工作流生成的版本一致）
+transport.poolCount = 4
+transport.heartbeatInterval = 15
+transport.heartbeatTimeout = 45
+
+# 注意：frpc 暴露的是 nginx 边缘层 8080（不是 artex 的 8787），
+# 静态资源走 nginx 的 gzip_static + 长缓存，/api 再由 nginx 反代到 8787。
 [[proxies]]
 name = "artex-web"
 type = "tcp"
@@ -33,6 +49,6 @@ remotePort = 18087          # 公网访问 http://203.195.195.52:18087
 # # frps 侧需：vhostHTTPPort = 8080
 # # 访问：http://artex.example.com:8080
 #
-# 变体 B：直接用 7023 作为对外 Web 端口（把 7023 当 vhostHTTPPort 用）
+# 变体 B：直接用 bindPort 对应的端口作为对外 Web 端口（把它当 vhostHTTPPort 用）
 # 则 frps 配置改为 vhostHTTPPort = 7023，客户端用 type = "http" + customDomains，
-# 或者保留 type="tcp" 但 remotePort = 7023（frps 的 bindPort 就不能也是 7023）。
+# 或者保留 type = "tcp" 但 remotePort = 7023（此时 frps 的 bindPort 不能也是 7023）。

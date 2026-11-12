@@ -84,10 +84,22 @@ ARTEX 关键事实（已核对源码）：
    curl -fsSL -o frp.tgz https://github.com/fatedier/frp/releases/download/v0.61.0/frp_0.61.0_linux_amd64.tar.gz
    tar -xzf frp.tgz && install -m755 frp_0.61.0_linux_amd64/frps /usr/local/bin/frps
    ```
-2. 写配置 `/etc/frp/frps.toml`（见 `deploy/frps.toml`），要点：
-   - `bindPort = 7023`
-   - `auth.token = "<强口令>"`（与 GitHub Secret `FRP_TOKEN` 一致）
+2. 写配置 `/etc/frp/frps.toml`（见 `deploy/frps.toml`）。`bindPort` 与 `auth.token`
+   用 frp 原生的环境变量模板语法读取，真实值只放在服务器本地的
+   `/etc/frp/frps.env`，**必须与 GitHub Environment `production` 下的两个 secrets 一致**：
+   - `FRP_BIND_PORT = 7023` → `bindPort`
+   - `FRP_TOKEN = <强口令>` → `auth.token`（不要写进仓库文件）
    - `allowPorts` 必须包含 `18087`（或你自定义的 `FRP_REMOTE_PORT`）
+
+   ```bash
+   sudo tee /etc/frp/frps.env >/dev/null <<'EOF'
+   FRP_BIND_PORT=7023
+   FRP_TOKEN=<与 GitHub Environment secret FRP_TOKEN 相同的值>
+   EOF
+   sudo chmod 600 /etc/frp/frps.env
+   # systemd unit 里加 EnvironmentFile=/etc/frp/frps.env，然后 restart frps
+   ```
+
 3. 放行端口：
    ```bash
    # 云厂商安全组放行 7023 与 18087；主机防火墙：
@@ -102,26 +114,45 @@ ARTEX 关键事实（已核对源码）：
 
 > 如果 **7023 其实是你要访问的 Web 端口**（即 frps 的 `vhostHTTPPort`），
 > 把 `deploy/frpc.toml` 里的 proxy 改成 `type = "http"` + `customDomains`，
-> 并让 frps 配 `vhostHTTPPort = 7023`（此时 `bindPort` 用别的端口，例如 7000）。
+> 并让 frps 配 `vhostHTTPPort = 7023`（此时 secret `FRP_BIND_PORT` 换成别的端口，例如 7000）。
 
-## 2. GitHub Secrets / Variables
+## 2. GitHub Environment secrets（必填）
 
-仓库 → Settings → Secrets and variables → Actions
+frpc 的 `auth.token` 与 `serverPort`（= frps `bindPort`）都从 **Environment secrets** 注入，
+仓库里不再有明文。工作流在 job 上声明了 `environment: production`，所以 secret 必须建在
+**Settings → Environments → production → Environment secrets**，不是仓库级 Secrets。
+（同名仓库级 secret 会被 Environment 级覆盖，Environment 级优先。）
 
-**Secrets（必填）**
+**Environment `production`（必建）**
 
-| 名称 | 说明 |
-|---|---|
-| `FRP_TOKEN` | frps 的 `auth.token`；frps 未设 token 则留空不建 |
+| Secret 名称 | 值 | 用途 |
+|---|---|---|
+| `FRP_TOKEN` | 与 frps `auth.token` 完全一致的强口令 | 渲染 frpc 的 `auth.token` |
+| `FRP_BIND_PORT` | `7023` | 渲染 frpc 的 `serverPort`（= frps `bindPort`） |
 
-**Secrets（按需）**
+> 两个值都不落仓库：服务端放 `/etc/frp/frps.env`（权限 600），客户端放 GitHub Environment secrets。
+> 缺任一个，`Render frpc.toml` 会直接失败，不会静默连错端口或空 token。
+> 口令含 `*` `!` 等字符时网页直接填入即可，工作流会做 TOML 转义，不要自己加引号；
+> `FRP_BIND_PORT` 只填纯数字。日志里端口显示 `***` 是 GitHub 自动脱敏，属正常现象。
+> **不要**给 `production` 加 required reviewers / wait timer，否则 cron 轮次会卡在等待审批。
+
+用 gh CLI 创建（口令交互式输入，不落命令行历史）：
+
+```bash
+gh api -X PUT repos/Janit8r/hihaff/environments/production --input - <<<'{}' >/dev/null
+gh secret set FRP_BIND_PORT --env production --repo Janit8r/hihaff --body '7023'
+gh secret set FRP_TOKEN --env production --repo Janit8r/hihaff   # 回车后粘贴口令
+gh secret list --env production --repo Janit8r/hihaff
+```
+
+**仓库级 Secrets（按需）**
 
 | 名称 | 说明 |
 |---|---|
 | `ANTHROPIC_API_KEY` | LLM 调用 |
 | `OPENAI_API_KEY` | LLM 调用 |
 
-**Variables（可选）**
+**Variables（可选，也可以建在 Environment 上）**
 
 | 名称 | 默认 | 说明 |
 |---|---|---|
@@ -167,7 +198,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://203.195.195.52:18087/
 curl -sS http://203.195.195.52:18087/api/health
 ```
 
-Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址；
+Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址与凭据来源（Environment secrets）；
 `Wait for health`、`Start frpc`、`Keep alive` 三步的日志里能看到探活与 frp 握手结果。
 
 ## 5. 为什么需要 cron + keep-alive
@@ -175,12 +206,12 @@ Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址；
 GitHub 托管 runner **是临时的**，单个 job 最长 6 小时，结束即销毁，进程与隧道随之消失。
 所以工作流这样设计：
 
-- `timeout-minutes: 355` —— 跑到 5h55m 由平台回收；
-- `Keep alive` —— 每 30s 检查 artex / frpc 存活，掉线自动拉起，窗口 ~5h40m 后主动退出；
-- `schedule: 0 */6 * * *` —— 每 6 小时拉新一轮；
+- `timeout-minutes: 150` —— 整轮约 110 分钟，短于 cron 的 2 小时，避免每轮被取消导致缓存后置步骤不执行；
+- `Keep alive` —— 每 30s 检查 artex / nginx / frpc 存活，掉线自动拉起；拆两段各 50 分钟，段间存一次快照；
+- `schedule: 0 */2 * * *` —— 每 2 小时拉新一轮；
 - `concurrency: artex-frp` + `cancel-in-progress: true` —— 新一轮顶掉旧一轮，避免占用重复。
 
-效果：**近乎连续在线**，每 6 小时有数十秒的切换空窗。
+效果：**近乎连续在线**，每 2 小时有数十秒的切换空窗。
 需要 7×24 零空窗，就把同一份构建产物部署到常驻主机，见第 7 节。
 
 ## 6. 排错
@@ -190,7 +221,11 @@ GitHub 托管 runner **是临时的**，单个 job 最长 6 小时，结束即�
 | `Build artex` 报 `go: downloading go1.26.x` 失败 | `go.mod` 要求较新工具链 | 工作流已用 `go-version-file` + `check-latest`，自动下载；公司网络代理需放通 `proxy.golang.org` |
 | `静态导出缺少 out/index.html` | 前端构建失败 | 看 `Build frontend` 日志；`npm ci` 需要 `web/package-lock.json`（仓库已有） |
 | `artex 进程已退出` | 缺 PostgreSQL 或 DSN 错 | 检查 `services.postgres` 健康、`ARTEX_PG_DSN` 密码一致 |
-| frpc 日志 `login to server failed` | token 不匹配 / 端口不通 | 核对 `FRP_TOKEN`；`telnet 203.195.195.52 7023` |
+| `Render frpc.toml` 报 `缺少 Environment secret ...` | 环境名不匹配，或 secret 建在了仓库级而不是 Environment 级 | 核对 job 的 `environment: production` 与 Settings → Environments → production 下的 `FRP_TOKEN` / `FRP_BIND_PORT` |
+| `FRP_BIND_PORT 必须是纯数字端口` | secret 里混入了引号、空格或说明文字 | 只填 `7023` |
+| frpc 日志 `login to server failed` | `FRP_TOKEN` 与 frps 的 `auth.token` 不一致 / 端口不通 | 核对 Environment secret 与 `/etc/frp/frps.env`；`telnet 203.195.195.52 7023` |
+| 日志里 `serverPort = ***` | GitHub 自动脱敏短数字 secret | 正常现象，写进 `/tmp/frpc.toml` 的是真实值 |
+| workflow 一直停在 "Waiting for approval" | Environment 加了 required reviewers / wait timer | 在 Environment 保护规则里去掉，否则定时轮次无法自动续期 |
 | frpc 日志 `port already used` | `remotePort` 被占或被 `allowPorts` 拒 | 换 `FRP_REMOTE_PORT` 或扩大 `allowPorts` |
 | 公网 502/超时但 job 正常 | 安全组未放行 `18087` | 云控制台放行 + 主机防火墙 |
 | 前端白屏 | 未用 `embedui` 构建 | 确认 `Sync frontend` 与 `-tags embedui` 都执行了 |

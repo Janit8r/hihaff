@@ -29,9 +29,10 @@ concurrency:
 env:
   # ---- ARTEX 源码 ----
   ARTEX_REPO: https://github.com/RuoJi6/ARTEX.git
-  # ---- frp 服务端（你给的 203.195.195.52:7023 作为 frps 的 bind_port）----
+  # ---- frp 服务端 ----
   FRP_SERVER_ADDR: "203.195.195.52"
-  FRP_SERVER_PORT: "7023"
+  # frps 的 bindPort 与 auth.token 不再写死在这里，改由 Environment secrets 注入：
+  # 见 jobs.serve.environment / jobs.serve.env 里的 FRP_BIND_PORT、FRP_TOKEN。
   # 公网访问端口：需要在 frps 的 allow_ports 与云安全组里放行
   FRP_REMOTE_PORT: ${{ vars.FRP_REMOTE_PORT || '18087' }}
   # ---- runner 内部 ----
@@ -49,6 +50,12 @@ jobs:
   serve:
     name: build + run + frp tunnel
     runs-on: ubuntu-latest
+    # 关键：只有声明 environment，secrets.FRP_TOKEN / secrets.FRP_BIND_PORT
+    # 才会解析到该 Environment 下的 secrets（而不是仓库级 secrets）。
+    # 名称必须与 GitHub → Settings → Environments 里创建的一致。
+    # 不要给这个 Environment 加 required reviewers / wait timer，
+    # 否则 cron 触发的无人值守轮次会卡在等待审批，隧道直接断线。
+    environment: production
     # 值守拆成两段（各 ~50 分钟），中间存一次快照；整轮约 110 分钟，
     # 必须短于 cron 的 2 小时，否则每轮都会被下一轮取消，缓存后置步骤就不会执行。
     timeout-minutes: 150
@@ -72,7 +79,12 @@ jobs:
     env:
       ARTEX_PG_DSN: postgres://artex:artex_ci_ephemeral_pw@127.0.0.1:5432/artex?sslmode=disable
       ARTEX_SKILL_DIR: ${{ github.workspace }}/artex/skills
+      # ---- GitHub Environment secrets（environment: production）----
+      # FRP_TOKEN     → frps 的 auth.token（客户端 auth.token）
+      # FRP_BIND_PORT → frps 的 bindPort（客户端 serverPort）
+      # 两个值只存在 Environment secrets 里，不写进仓库；缺失时 Render frpc.toml 会直接失败。
       FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+      FRP_SERVER_PORT: ${{ secrets.FRP_BIND_PORT }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ARTEX_LLM_PROVIDER: ${{ vars.ARTEX_LLM_PROVIDER }}
@@ -177,16 +189,24 @@ jobs:
       - name: Render frpc.toml
         run: |
           set -euo pipefail
+          # 两个值必须来自 Environment secrets。缺失就立刻失败，
+          # 避免 token 为空 / 端口为空导致握手失败却还在空转值守。
+          : "${FRP_TOKEN:?缺少 Environment secret FRP_TOKEN（frps auth.token）}"
+          : "${FRP_SERVER_PORT:?缺少 Environment secret FRP_BIND_PORT（frps bindPort）}"
+          case "${FRP_SERVER_PORT}" in
+            ''|*[!0-9]*) echo "FRP_BIND_PORT 必须是纯数字端口" >&2; exit 1 ;;
+          esac
+          # TOML 基本字符串转义：反斜杠与双引号（token 里的 * ! 等字符无需转义）
+          token_escaped=${FRP_TOKEN//\\/\\\\}
+          token_escaped=${token_escaped//\"/\\\"}
           {
             echo "serverAddr = \"${FRP_SERVER_ADDR}\""
             echo "serverPort = ${FRP_SERVER_PORT}"
             echo "loginFailExit = false"
             echo "log.to = \"/tmp/frpc.log\""
             echo "log.level = \"info\""
-            if [ -n "${FRP_TOKEN}" ]; then
-              echo "auth.method = \"token\""
-              echo "auth.token = \"${FRP_TOKEN}\""
-            fi
+            echo "auth.method = \"token\""
+            echo "auth.token = \"${token_escaped}\""
             echo ""
             echo "# 以下为客户端级 transport 配置，必须写在 [[proxies]] 之前"
             echo "transport.poolCount = 4"
@@ -200,7 +220,7 @@ jobs:
             echo "localPort = ${EDGE_PORT}"
             echo "remotePort = ${FRP_REMOTE_PORT}"
           } > /tmp/frpc.toml
-          echo "----- frpc.toml -----"
+          echo "----- frpc.toml（auth.token 已脱敏）-----"
           sed -e 's/^\(auth.token = \).*/\1"***"/' /tmp/frpc.toml
           frpc verify -c /tmp/frpc.toml
 
@@ -478,6 +498,7 @@ jobs:
             echo "- 公网地址：http://${FRP_SERVER_ADDR}:${FRP_REMOTE_PORT}"
             echo "- 本地监听：http://127.0.0.1:8787"
             echo "- frps：${FRP_SERVER_ADDR}:${FRP_SERVER_PORT}"
+            echo "- frp 凭据来源：Environment \`production\` 的 secrets（FRP_TOKEN / FRP_BIND_PORT）"
             echo "- ARTEX commit：${ARTEX_COMMIT}"
             echo "- 触发 commit：${{ github.sha }}"
           } >> "$GITHUB_STEP_SUMMARY"
