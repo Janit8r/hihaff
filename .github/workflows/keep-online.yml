@@ -1,0 +1,62 @@
+name: artex-keep-online
+
+# 为什么不直接靠主 workflow 的 schedule：
+# GitHub 的 scheduler 对长跑 workflow 极不可靠。改成错峰 17 */2 之后，
+# 实测 04:17 / 06:17 / 08:17 三班依然全部没有创建 run；主 workflow 跑满
+# 5h33m 后正常结束，公网就一直 502，直到有人手动触发。
+#
+# 这个看门狗是**独立的轻量 workflow**（每个 run 只有几秒），它的 schedule
+# 不会被主 workflow 的长 job 拖住。每 10 分钟检查主 workflow 有没有活跃 run，
+# 没有就用 workflow_dispatch 拉起一轮。
+# 用 GITHUB_TOKEN 触发 workflow_dispatch 是 GitHub 明确允许的例外
+# （"with the exception of workflow_dispatch and repository_dispatch"），
+# 所以不需要额外 PAT / 外部定时服务。
+
+on:
+  schedule:
+    # 每 10 分钟，全部避开整点分钟；班次够密，丢掉几班也不影响接力。
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # 读取 run 状态 + 触发 workflow_dispatch 都需要
+  actions: write
+
+concurrency:
+  # 与主 workflow 不同的组，避免互相顶掉
+  group: artex-keep-online
+  cancel-in-progress: true
+
+jobs:
+  ensure:
+    name: ensure deploy job is running
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check and restart if needed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          wf="deploy-artex-frp.yml"
+          branch=$(gh api "repos/${repo}" --jq '.default_branch')
+          active=$(gh api "repos/${repo}/actions/workflows/${wf}/runs?per_page=20" \
+            --jq '[.workflow_runs[]
+                   | select(.status=="queued" or .status=="in_progress" or .status=="pending")]
+                  | length')
+          echo "主 workflow 活跃 run 数: ${active}（默认分支 ${branch}）"
+          if [ "${active}" -gt 0 ]; then
+            echo "已有运行中的部署，本次不重复触发"
+            exit 0
+          fi
+          echo "::warning::没有活跃部署，触发 workflow_dispatch 拉起一轮"
+          gh workflow run "${wf}" --repo "${repo}" --ref "${branch}"
+          echo "已触发，下一轮将在数分钟内完成构建并接管隧道"
+          {
+            echo "### 看门狗"
+            echo ""
+            echo "- 检查时刻：$(date -u '+%F %T UTC')"
+            echo "- 主 workflow 活跃 run：${active} → 已触发新一轮"
+          } >> "$GITHUB_STEP_SUMMARY"

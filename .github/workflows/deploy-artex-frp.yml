@@ -13,11 +13,12 @@ on:
         default: ""
         type: string
   schedule:
-    # 关键 1：绝对不要排在整点。GitHub 文档明确说「每小时开始是高峰期」，
-    #   整点 schedule 会被延迟甚至整班丢弃。实测 0 */2 的两班分别延迟 87/71 分钟，
-    #   10:00Z 那一班直接被 drop，造成 1~2 小时断线。改到第 17 分错峰。
-    # 关键 2：job 寿命(~5h33m) 远大于 cron 间隔(2h)，配合 cancel-in-progress
-    #   形成「滚动续期」：新一轮起来才顶掉旧轮；即使漏掉一两班，旧轮仍在服务。
+    # 注意：这里只是**兜底**，真正的续期主力是 .github/workflows/keep-online.yml
+    # 的看门狗（每 10 分钟检查一次，没有活跃 run 就 workflow_dispatch 拉起）。
+    # 原因：GitHub 的 scheduler 对长跑 workflow 会大量丢班 —— 原先 0 */2 的
+    # 10:00Z 班被 drop；改成错峰 17 */2 后，04:17 / 06:17 / 08:17 三班依然
+    # 全都没创建 run，主 workflow 跑满 5h33m 结束后公网直接 502。
+    # 绝对不要排在整点（GitHub 文档：每小时开始是高峰期，queued jobs 可能被 drop）。
     # cron 用 UTC；*/2 的第 17 分 = 北京时间偶数点的 17 分。
     - cron: "17 */2 * * *"
   push:
@@ -65,10 +66,10 @@ jobs:
     # 不要给这个 Environment 加 required reviewers / wait timer，
     # 否则 cron 触发的无人值守轮次会卡在等待审批，隧道直接断线。
     environment: production
-    # 值守 30min + 300min = 330 分钟（~5h30m），加构建 ≈5h33m，
-    # 故意远大于 cron 的 2 小时间隔：让旧轮在下一轮就绪前一直顶着，漏班也不断线。
-    # 每轮通常被下一轮 concurrency 取消，所以数据保存不依赖「正常结束」，
-    # 而是靠：30 分钟处一次显式缓存保存 + 每 10 分钟本地快照 + if: always() 收尾抢救。
+    # 值守 30min + 300min = 330 分钟（~5h30m），加构建 ≈5h33m。
+    # 拉长是为了少切换：跑满后由 keep-online 看门狗（每 10 分钟巡检）拉起下一轮。
+    # 保存不依赖「正常结束」：30 分钟处显式存一次缓存 + 每 10 分钟本地快照
+    # + if: always() 收尾抢救；无论是自然结束、被顶掉还是超时都能保住数据。
     # 350 分钟留余量（GitHub 托管 runner 单 job 硬上限 6 小时）。
     timeout-minutes: 350
 
