@@ -231,56 +231,64 @@ Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址与凭据�
 以及「跨轮持久化」块的恢复来源 / 数据库恢复状态 / public 表数量；
 `Wait for health`、`Start frpc`、`Keep alive` 三步的日志里能看到探活与 frp 握手结果。
 
-## 5. 在线保障：主 workflow + 看门狗
+## 5. 在线保障：自我续期（不依赖 GitHub 定时调度）
 
 GitHub 托管 runner **是临时的**，单个 job 最长 6 小时，结束即销毁，进程与隧道随之消失。
-现在有两个 workflow：
 
-| 文件 | 职责 |
-|---|---|
-| `.github/workflows/deploy-artex-frp.yml` | 构建 + 起服务 + frp 隧道；`timeout-minutes: 350`，值守 30 + 300 分钟（≈5h33m） |
-| `.github/workflows/keep-online.yml` | **看门狗**，每 10 分钟巡检；主 workflow 没有活跃 run 就用 `workflow_dispatch` 拉起一轮 |
+### 结论先行：不能再靠 schedule
 
-### 为什么不能只靠 schedule
-
-实测教训（UTC）：
+实测这个仓库的 GitHub 定时调度**连续丢班**（UTC）：
 
 | 阶段 | 配置 | 结果 |
 |---|---|---|
 | 最初 | `0 */2`（整点） | 18:00 班延迟 87 分钟、08:00 班延迟 71 分钟、10:00 班整班被 drop |
-| 第一次修 | `17 */2`（错峰）+ job 拉长到 5h33m | 02:38 那一轮跑满 5h33m 后正常结束，但 **04:17 / 06:17 / 08:17 三班全都没创建 run**，公网从 08:11 起一直 502 |
+| 错峰 + 拉长 job | `17 */2` + 5h33m | 02:38 那轮跑满后正常结束，但 **04:17 / 06:17 / 08:17 三班全都没创建 run**，公网从 08:11 起 502 |
+| 新建轻量看门狗 | `3,13,23,33,43,53 * * * *` | **08:33 / 08:43 两班同样没触发** —— 连秒级 workflow 的 schedule 都丢 |
 
-也就是说，**错峰只解决了整点拥堵，解决不了 GitHub scheduler 对长跑 workflow 大量丢班**。
-所以改成让一个独立的**轻量** workflow 做主力：它每个 run 只有几秒，schedule 不会被
-长 job 拖住；班次密到 10 分钟一班，丢掉几班也不影响接力。主 workflow 自己的
-`schedule` 保留作兜底，`concurrency` 保证同时只有一个部署在跑。
+所以主力改成 **自我续期**：每一轮服务就绪后，立刻用 `GITHUB_TOKEN` 触发下一轮
+`workflow_dispatch`，把它排进 `concurrency` 队列。之后本轮无论正常结束、失败、被 cancel
+还是被 timeout 回收，排队的下一棒都会立即接上 —— **完全不需要等任何 cron**。
 
-看门狗用 `GITHUB_TOKEN` + `permissions: actions: write` 触发 `workflow_dispatch`——
 GitHub 文档明确说 `workflow_dispatch` / `repository_dispatch` 是「GITHUB_TOKEN 触发的事件
-不会再启动新 run」这条规则的**例外**，所以不需要 PAT 或外部定时服务。
+不会再启动新 run」这条规则的**例外**，因此无需 PAT 或外部定时服务。
 
-关于错峰，官方文档原文：
+### 三层保障
+
+| 机制 | 角色 |
+|---|---|
+| 主 workflow 的 `Queue successor run` 步骤 | **主力**：服务就绪即排下一棒 |
+| `.github/workflows/keep-online.yml` 看门狗 | 兜底：发现没有活跃/排队 run 就补一轮；但它的 schedule 同样可能被丢，不能当主力 |
+| 主 workflow 的 `schedule: 17 */2` | 最后的兜底 |
+
+`concurrency` 用 `cancel-in-progress: ${{ inputs.successor != 'true' }}` 区分两种触发：
+
+- 自我续期传 `successor=true` → 求值为 `false` → **排队**，等当前轮完整跑完（含数据快照
+  收尾）再接棒，不打断服务；
+- `push` / `schedule` / 手动触发 → 求值为 `true` → 立即顶掉旧轮，保证改代码能马上生效。
+
+GitHub 保证同一组最多 1 running + 1 pending，不会堆积；稳态就是「1 个在跑 + 1 个排队」。
+
+关于错峰（虽已不是主力，仍是兜底），官方文档原文：
 
 > "The `schedule` event can be delayed during periods of high loads... High load times include
 > the start of every hour. If the load is sufficiently high enough, some queued jobs may be dropped.
 > To decrease the chance of delay, schedule your workflow to run at a different time of the hour."
 
-所以 `cron` **绝对不要写 `0 ...` 整点**。cron 用 UTC；看门狗 `3,13,23,33,43,53 * * * *`
-即每小时的第 3/13/…/53 分。
+所以 `cron` **绝对不要写 `0 ...` 整点**，cron 用 UTC。
 
 ### 空窗与数据
 
-- 主 workflow 一轮跑满后，看门狗最多 **10 分钟**内发现并拉起下一轮，加上构建约 3~5 分钟，
-  最坏约 15 分钟空窗（此前是 1~2 小时甚至更久）。
-- 想更短：把看门狗 cron 改成每 5 分钟（GitHub 最小间隔），例如 `2,7,12,...,57 * * * *`；
-  代价是 Actions 列表里每天多出约 288 条几秒钟的 run 记录（public 仓库不计分钟）。
-- 数据保存不依赖 `actions/cache` 的隐式后置步骤，而是三重保险：30 分钟处显式
-  `Save state cache`、每 10 分钟本地快照、`if: always()` 收尾抢救；自然结束、被顶掉、
-  超时都能保住数据，最坏丢 ≤10 分钟。
+- 接棒轮已排队，当前轮一结束就立刻开始构建，空窗只有 **3~5 分钟**（构建 + frpc 握手），
+  不再有「等下一班 cron」的 1~2 小时真空。
+- 风险点：`Queue successor run` 本身失败（API 故障）会断链。它带 3 次重试；真断了用
+  `gh workflow run deploy-artex-frp.yml --repo Janit8r/hihaff` 手工接上。
+- 想让兜底也可靠：用外部定时服务（cron-job.org / Cloudflare Workers Cron）每 10 分钟调用
+  `POST /repos/Janit8r/hihaff/actions/workflows/keep-online.yml/dispatches`（需 PAT）。
+- 数据保存三重保险：30 分钟处显式 `Save state cache`、每 10 分钟本地快照、
+  `if: always()` 收尾抢救；自然结束、被顶掉、超时都能保住数据，最坏丢 ≤10 分钟。
 
-应急手动拉起：`gh workflow run deploy-artex-frp.yml --repo Janit8r/hihaff`。
 需要真正 7×24 零空窗，就把同一份构建产物部署到常驻主机，见第 7 节 ——
-用 Actions 硬撑常驻服务终究受 6 小时上限和调度可靠性限制。
+用 Actions 硬撑常驻服务终究受 6 小时上限限制。
 
 ## 6. 排错
 
@@ -298,10 +306,10 @@ GitHub 文档明确说 `workflow_dispatch` / `repository_dispatch` 是「GITHUB_
 | 公网 502/超时但 job 正常 | 安全组未放行 `18087` | 云控制台放行 + 主机防火墙 |
 | 前端白屏 | 未用 `embedui` 构建 | 确认 `Sync frontend` 与 `-tags embedui` 都执行了 |
 | 每轮切换时短暂 404（数分钟） | 新轮构建 / frpc 握手期间的切换空窗 | 属预期；见第 5、7 节 |
-| 公网长时间 502、主 workflow 没有活跃 run | GitHub scheduler 丢班（整点、错峰都发生过），主轮跑满 5h33m 后没接上 | 看门狗 `keep-online.yml` 每 10 分钟会自动补一轮；检查它的 run 是否在执行、日志里 `活跃 run 数` 是否为 0、是否报 `gh workflow run` 失败 |
-| 看门狗日志报 `could not create workflow dispatch event` / 403 | `GITHUB_TOKEN` 缺 `actions: write`（仓库默认权限被设为只读） | 确认 `keep-online.yml` 的 `permissions: actions: write`，以及 Settings → Actions → Workflow permissions 允许 |
-| 看门狗一直显示「已有运行中的部署」但服务仍 502 | 主 run 还在 `in_progress`，但 frpc/artex 已挂 | 看主 run 的 `Keep alive` 心跳；必要时手动 `gh workflow run` 顶掉（concurrency 会取消旧的） |
-| 想立刻恢复服务 | 不想等看门狗下一班 | Actions → Run workflow，或 `gh workflow run deploy-artex-frp.yml --repo Janit8r/hihaff` |
+| 公网长时间 502、主 workflow 没有活跃 run | 自我续期链条断了（`Queue successor run` 失败），且 GitHub scheduler 丢班没能兜住 | 先看上一轮 `Queue successor run` 日志；手动 `gh workflow run deploy-artex-frp.yml --repo Janit8r/hihaff` 重新起链，新轮会再次排下一棒 |
+| `Queue successor run` 报 `无法排入下一轮` | `GITHUB_TOKEN` 缺 `actions: write`，或 dispatch API 临时故障 | 确认 `permissions: actions: write` 与 Settings → Actions → Workflow permissions；步骤有 3 次重试，仍失败就手动起链 |
+| Actions 里同时看到 1 个 `in_progress` + 1 个 `queued` | 自我续期排好的接棒轮在排队 | **属预期**；`concurrency` 保证最多 1+1，当前轮结束后排队轮自动接上 |
+| 想立刻恢复服务 / 冷启动起链 | 链条断了或刚改完代码 | Actions → Run workflow，或 `gh workflow run deploy-artex-frp.yml --repo Janit8r/hihaff` |
 | 某轮显示 `cancelled` | 被新触发的一轮 concurrency 顶掉 | 属预期；检查 `Snapshot state (final)` / `Save state cache (final)` 是否仍以 `always()` 执行并保存成功 |
 | 每轮都是新数据 / Summary 显示 `数据库恢复: false` | 恢复失败或首轮无快照 | 看 `Restore database from snapshot` 日志；确认 `public 表数量` 与上一轮一致 |
 | 日志 `unrecognized configuration parameter "transaction_timeout"` | pg_dump 18 导出的 dump 头含 PG18 专有 GUC，PG16 服务端不认 | 工作流已自动过滤并重试；若仍失败，把 service 镜像升到 `postgres:18-alpine` 或看下一行 |

@@ -2,7 +2,8 @@ name: artex-deploy-frp
 
 # 用途：在 GitHub Actions runner 上从源码构建 ARTEX（Go 后端 + Next 静态前端），
 #      拉起 PostgreSQL，跑起 Web 服务（:8787），再用 frpc 反向代理到公网 frps
-#      （203.195.195.52:7023）。runner 是临时的，所以用 keep-alive + 定时 cron 续命。
+#      （203.195.195.52:7023）。runner 是临时的，所以用「自我续期」：
+#      每轮服务就绪后立刻把下一轮排进 concurrency 队列，不依赖 GitHub 的 schedule。
 
 on:
   workflow_dispatch:
@@ -12,14 +13,18 @@ on:
         required: false
         default: ""
         type: string
+      successor:
+        description: "内部使用：由上一轮自我续期触发时会传 true，表示排队接棒而非顶掉当前轮"
+        required: false
+        default: ""
+        type: string
   schedule:
-    # 注意：这里只是**兜底**，真正的续期主力是 .github/workflows/keep-online.yml
-    # 的看门狗（每 10 分钟检查一次，没有活跃 run 就 workflow_dispatch 拉起）。
-    # 原因：GitHub 的 scheduler 对长跑 workflow 会大量丢班 —— 原先 0 */2 的
-    # 10:00Z 班被 drop；改成错峰 17 */2 后，04:17 / 06:17 / 08:17 三班依然
-    # 全都没创建 run，主 workflow 跑满 5h33m 结束后公网直接 502。
+    # 只是**兜底**。续期主力是「Queue successor run」步骤的自我续期，
+    # 以及 .github/workflows/keep-online.yml 看门狗。
+    # 原因：GitHub 的 scheduler 在本仓库会大量丢班 —— 整点 0 */2 的 10:00Z 班被 drop，
+    # 错峰 17 */2 的 04:17 / 06:17 / 08:17 三班也全都没创建 run，
+    # 连新建的看门狗 08:33 / 08:43 班都没触发。靠 cron 续命已被证明不可靠。
     # 绝对不要排在整点（GitHub 文档：每小时开始是高峰期，queued jobs 可能被 drop）。
-    # cron 用 UTC；*/2 的第 17 分 = 北京时间偶数点的 17 分。
     - cron: "17 */2 * * *"
   push:
     branches: [main]
@@ -34,7 +39,12 @@ permissions:
 
 concurrency:
   group: artex-frp
-  cancel-in-progress: true
+  # 自我续期排的「接棒轮」(successor=true) 用 false → 排队等当前轮完整跑完
+  # （含数据快照收尾）后才启动，不打断服务；其余触发（push / schedule / 手动）
+  # 仍立即顶掉旧轮，保证改代码能马上生效。
+  # GitHub 保证同一 concurrency 组最多 1 running + 1 pending，不会堆积。
+  # inputs 在 push/schedule 事件里解析为空字符串，表达式求值为 true。
+  cancel-in-progress: ${{ inputs.successor != 'true' }}
 
 env:
   # ---- ARTEX 源码 ----
@@ -569,6 +579,37 @@ jobs:
             echo "- ARTEX commit：${ARTEX_COMMIT}"
             echo "- 触发 commit：${{ github.sha }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 6.5 自我续期：在线保障的核心，不依赖 GitHub schedule ----------
+      - name: Queue successor run
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 服务已就绪 → 立刻把下一轮排进 concurrency 队列。
+          # 之后本轮无论正常结束、失败、被 cancel 还是被 timeout 回收，
+          # 排队的下一棒都会立即接上，完全不需要等 cron。
+          # workflow_dispatch 是「GITHUB_TOKEN 触发的事件不再启动新 run」这条规则的
+          # 明确例外（GitHub 文档），所以不需要 PAT / 外部定时服务。
+          repo="${GITHUB_REPOSITORY}"
+          wf="deploy-artex-frp.yml"
+          branch=$(gh api "repos/${repo}" --jq '.default_branch')
+          for i in 1 2 3; do
+            if gh workflow run "${wf}" --repo "${repo}" --ref "${branch}" -f successor=true; then
+              echo "下一轮已排入队列（第 ${i} 次尝试，successor=true）"
+              {
+                echo ""
+                echo "- 自我续期：已排入下一轮（排队接棒，不打断本轮）"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "触发失败，5 秒后重试（${i}/3）" >&2
+            sleep 5
+          done
+          echo "::error::无法排入下一轮；链条可能中断，请手动 Run workflow 或依赖看门狗" >&2
+          exit 1
 
       # ---------- 7. 值守：掉线自愈；拆成两段，段间存快照 ----------
       - name: Write keepalive + snapshot helpers
