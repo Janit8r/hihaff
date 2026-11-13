@@ -66,6 +66,10 @@ env:
   # 这个目录整体进 Actions 缓存：数据库转储 + ARTEX 自身数据目录。
   # 下一轮先恢复它，再启动 artex，做到「接着上次跑」。
   STATE_DIR: ${{ github.workspace }}/.artex-state
+  # ---- Nuclei POC 资产（artex-full 新增的常驻部署依赖）----
+  NUCLEI_VERSION: "3.11.1"
+  # 设为 0 可跳过 nuclei / 模板库下载（只留空目录占位：页面不报错但列表为空）
+  ARTEX_NUCLEI_ASSETS: ${{ vars.ARTEX_NUCLEI_ASSETS || '1' }}
   NEXT_TELEMETRY_DISABLED: "1"
 
 jobs:
@@ -352,6 +356,100 @@ jobs:
           fi
           echo "STATE_DB_RESTORED=true" >> "$GITHUB_ENV"
           echo "STATE_DB_TABLES=${tables}" >> "$GITHUB_ENV"
+
+      # ---------- 5.5 Nuclei POC 资产 ----------
+      # 200210xsb/artex-full 的 server/nuclei.go 与 server/assets_extra.go 把
+      #   /opt/artex/nuclei-templates  和  /opt/artex/bin/nuclei
+      # 写成 Go 常量（没有环境变量开关，是为常驻部署 /opt/artex 设计的）。
+      # 裸 runner 上没有这两个路径 → 打开 POC / 模板库页面就返回
+      # 「模板目录不可用: /opt/artex/nuclei-templates」。
+      # 这里把官方 nuclei + nuclei-templates 铺到它期望的位置；固定 key 独立缓存，
+      # 只在首次 miss 时下载一次。任何下载失败都只降级：目录仍然存在，
+      # 页面显示空列表而不是抛错，绝不影响部署主流程。
+      - name: Restore nuclei assets cache
+        id: nuclei-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.artex-nuclei
+          key: artex-nuclei-v1-3.11.1
+          restore-keys: |
+            artex-nuclei-
+
+      - name: Prepare nuclei POC assets
+        id: nuclei-prepare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          ROOT="${GITHUB_WORKSPACE}/.artex-nuclei"
+          BIN="${ROOT}/bin/nuclei"
+          TPL="${ROOT}/nuclei-templates"
+          mkdir -p "${ROOT}/bin" "${TPL}"
+
+          if [ "${ARTEX_NUCLEI_ASSETS:-1}" = "1" ]; then
+            # 1) nuclei 二进制（走 GitHub API 下载 release asset，比直链稳）
+            if [ ! -x "${BIN}" ]; then
+              echo "下载 nuclei v${NUCLEI_VERSION} ..."
+              tmp=$(mktemp -d)
+              if gh release download "v${NUCLEI_VERSION}" \
+                   --repo projectdiscovery/nuclei \
+                   --pattern "nuclei_${NUCLEI_VERSION}_linux_amd64.zip" \
+                   --dir "${tmp}" 2>/dev/null \
+                 && unzip -q -o "${tmp}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" -d "${tmp}/x" \
+                 && [ -f "${tmp}/x/nuclei" ]; then
+                install -m 0755 "${tmp}/x/nuclei" "${BIN}"
+                echo "nuclei 已安装"
+              else
+                echo "::warning::nuclei 二进制下载失败；模板浏览仍可用，实弹验证会提示未安装"
+              fi
+              rm -rf "${tmp}"
+            fi
+            # 2) 模板库：codeload tarball（不带 .git，比 git clone 小得多）
+            if [ ! -f "${TPL}/.artex-ready" ]; then
+              echo "下载 nuclei-templates ..."
+              tmp=$(mktemp -d)
+              if curl -fsSL --retry 2 --connect-timeout 20 --max-time 600 \
+                   -o "${tmp}/tpl.tgz" \
+                   "https://codeload.github.com/projectdiscovery/nuclei-templates/tar.gz/refs/heads/main" \
+                 || gh api "repos/projectdiscovery/nuclei-templates/tarball/main" > "${tmp}/tpl.tgz"; then
+                if mkdir -p "${tmp}/x" && tar -xzf "${tmp}/tpl.tgz" -C "${tmp}/x" --strip-components=1; then
+                  find "${TPL}" -mindepth 1 -delete 2>/dev/null || true
+                  cp -a "${tmp}/x/." "${TPL}/"
+                  : > "${TPL}/.artex-ready"
+                  echo "模板文件数: $(find "${TPL}" -type f -name '*.yaml' | wc -l)"
+                else
+                  echo "::warning::模板库解压失败；目录仍在，页面会显示空列表而不是报错"
+                fi
+              else
+                echo "::warning::模板库下载失败；目录仍在，页面会显示空列表而不是报错"
+              fi
+              rm -rf "${tmp}"
+            fi
+          else
+            echo "ARTEX_NUCLEI_ASSETS=${ARTEX_NUCLEI_ASSETS} → 跳过下载，仅创建空目录占位"
+          fi
+
+          # 3) 指到源码硬编码的位置：把 /opt/artex 整层软链到资产目录，零复制。
+          #    不能只给 nuclei-templates 做软链 —— Go 的 filepath.WalkDir 对根节点
+          #    用 Lstat，遇到符号链接只访问链接本身，会扫到 0 个 YAML 模板。
+          #    软链放在「中间层」时，/opt/artex/nuclei-templates 的最终组件是真实目录，
+          #    Lstat 得到目录类型，WalkDir 才会正常递归。/opt/artex/bin/nuclei 同理。
+          sudo rm -rf /opt/artex
+          sudo ln -s "${ROOT}" /opt/artex
+          echo "nuclei 模板目录: $(find /opt/artex/nuclei-templates -type f -name '*.yaml' | wc -l) 个 yaml"
+          echo "nuclei 二进制: $([ -x /opt/artex/bin/nuclei ] && echo 已安装 || echo 未安装)"
+          # 两个都下载失败时不要写空缓存，否则下一轮命中空缓存后每轮都得重下
+          if [ -f "${TPL}/.artex-ready" ] || [ -x "${BIN}" ]; then
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save nuclei assets cache
+        if: steps.nuclei-cache.outputs.cache-hit != 'true' && steps.nuclei-prepare.outputs.save == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.artex-nuclei
+          key: artex-nuclei-v1-3.11.1
 
       # ---------- 6. 起服务 ----------
       - name: Start artex

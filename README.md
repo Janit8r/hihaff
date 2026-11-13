@@ -192,6 +192,41 @@ gh secret list --env production --repo Janit8r/hihaff
 |---|---|---|
 | `FRP_REMOTE_PORT` | `18087` | 公网访问端口，须在 frps `allowPorts` 内 |
 | `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` | 空 | LLM 接入点 |
+| `ARTEX_NUCLEI_ASSETS` | `1` | 设成 `0` 跳过 nuclei / 模板库下载（只留空目录占位） |
+
+### Nuclei POC 模板库（切到 artex-full 后新增的依赖）
+
+`200210xsb/artex-full` 的 `server/nuclei.go` 与 `server/assets_extra.go` 把
+
+```
+/opt/artex/bin/nuclei
+/opt/artex/nuclei-templates
+```
+
+写成 **Go 常量**（没有环境变量开关，原本是给常驻部署 `/opt/artex` 用的）。
+裸 runner 上没有这两个路径，打开 POC / 模板库页面就会返回
+`模板目录不可用: /opt/artex/nuclei-templates`。
+
+工作流在 `Start artex` 之前加了三个步骤解决：
+
+| 步骤 | 作用 |
+|---|---|
+| `Restore nuclei assets cache` | 固定 key `artex-nuclei-v1-3.11.1`，跨轮复用，只在首次 miss 时下载 |
+| `Prepare nuclei POC assets` | 下载 nuclei v3.11.1 release + `nuclei-templates` 的 codeload tarball（不带 `.git`）；把 `/opt/artex` **整层软链**到 `.artex-nuclei` |
+| `Save nuclei assets cache` | 仅 cache miss 且至少一个资产下载成功时写缓存 |
+
+两个容易踩的坑：
+
+- **不能只给 `nuclei-templates` 做软链**：Go 的 `filepath.WalkDir` 对根节点用 `Lstat`，
+  根节点是符号链接时只访问链接本身，会扫到 **0 个 YAML**。软链放在中间层
+  (`/opt/artex` → 资产目录) 时，最终组件是真实目录，才能正常递归。
+- 下载失败只降级、不阻断部署：目录始终存在，页面显示空模板列表而不是抛错；
+  全失败时不写空缓存，下一轮会重新尝试。
+
+首次运行会多花 1~3 分钟下载并打包约百 MB 的模板库，之后每轮命中缓存只需几秒。
+升级 nuclei 版本时，同步改 `env.NUCLEI_VERSION` 和两个缓存步骤的
+`key: artex-nuclei-v1-<版本>`（版本进 key 才能触发重新下载）。
+不想付这个代价就把 Variable `ARTEX_NUCLEI_ASSETS` 设为 `0`。
 
 ## 3. 落地工作流
 
@@ -318,6 +353,8 @@ GitHub 保证同一组最多 1 running + 1 pending，不会堆积；稳态就是
 | 某轮显示 `cancelled` | 被新触发的一轮 concurrency 顶掉 | 属预期；检查 `Snapshot state (final)` / `Save state cache (final)` 是否仍以 `always()` 执行并保存成功 |
 | 每轮都是新数据 / Summary 显示 `数据库恢复: false` | 恢复失败或首轮无快照 | 看 `Restore database from snapshot` 日志；确认 `public 表数量` 与上一轮一致 |
 | 日志 `unrecognized configuration parameter "transaction_timeout"` | pg_dump 18 导出的 dump 头含 PG18 专有 GUC，PG16 服务端不认 | 工作流已自动过滤并重试；若仍失败，把 service 镜像升到 `postgres:18-alpine` 或看下一行 |
+| 页面报 `模板目录不可用: /opt/artex/nuclei-templates` | artex-full 把 nuclei / 模板库路径写成 Go 常量，runner 上默认没有；或 `Prepare nuclei POC assets` 的下载失败 | 看该步骤日志里的 `模板文件数`；正常首次下载后应有数千个 yaml。仍为 0 就检查 codeload / release 是否被网络拦，或手动触发新一轮重试 |
+| POC 模板列表为空但不报错 | 模板库下载被降级（目录存在、内容为空），或 `ARTEX_NUCLEI_ASSETS=0` | 确认 Variable 不是 `0`；删除缓存 `artex-nuclei-v1-3.11.1` 后重跑一轮强制重新下载 |
 | `::error::数据库快照恢复失败，本轮中止` | 快照损坏 / 版本差异过大，工作流故意中止以免覆盖好数据 | 用 Run workflow 的 `state_cache_key` 指定更早的快照；必要时删掉那份坏缓存 |
 | Summary 里 `public 表数量: 0` | 恢复被跳过（无快照）或恢复了空库 | 检查缓存是否命中、dump 是否非空；坏快照用 `state_cache_key` 回滚 |
 
@@ -328,8 +365,14 @@ GitHub 保证同一组最多 1 running + 1 pending，不会堆积；稳态就是
 ```bash
 # 本地产物：/tmp/artex-bin（或用 Actions 上传的 artifact）
 install -m755 artex-bin /opt/artex/artex
-install -d /opt/artex/data /opt/artex/skills
+install -d /opt/artex/data /opt/artex/skills /opt/artex/bin
 cp -a skills/. /opt/artex/skills/
+
+# artex-full 的 POC / 模板库页面硬编码 /opt/artex/bin/nuclei 与
+# /opt/artex/nuclei-templates，常驻部署也要铺上（约 100 MB 模板库）：
+cd /path/to/artex-full && ./mcp/install-mcp.sh --only nuclei --no-register
+# 等价于：下载 nuclei v3.11.1 到 /opt/artex/bin/nuclei，
+#        git clone --depth 1 projectdiscovery/nuclei-templates → /opt/artex/nuclei-templates
 
 export ARTEX_PG_DSN='postgres://artex:pw@127.0.0.1:5432/artex?sslmode=disable'
 export ARTEX_SKILL_DIR=/opt/artex/skills
