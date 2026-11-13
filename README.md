@@ -1,8 +1,13 @@
 # hihaff → Actions 部署 & 运行 ARTEX + frp 反代公网
 
 目标：在 **Janit8r/hihaff** 仓库上用 GitHub Actions 从源码构建并运行
-[RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)（Go 后端 + Next 静态前端），
+[200210xsb/artex-full](https://github.com/200210xsb/artex-full)（Go 后端 + Next 静态前端），
 再用 **frpc** 把 Web 端口反代到公网 frps **203.195.195.52:7023**。
+
+> **源码仓库**：`https://github.com/200210xsb/artex-full.git`（默认分支 `main`，
+> 已从旧上游仓库切换过来）。要换源，改 `.github/workflows/deploy-artex-frp.yml` 里两处：
+> 顶层 `env.ARTEX_REPO` 和 `Checkout ARTEX` 步骤的 `repository: 200210xsb/artex-full`，
+> 两处必须指向同一个仓库。
 
 ## 0. 架构
 

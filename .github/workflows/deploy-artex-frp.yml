@@ -48,7 +48,9 @@ concurrency:
 
 env:
   # ---- ARTEX 源码 ----
-  ARTEX_REPO: https://github.com/RuoJi6/ARTEX.git
+  # 源码统一取自 200210xsb/artex-full。
+  # 注意：Checkout ARTEX 步骤的 repository 必须与此保持同一个仓库（owner/repo 形式）。
+  ARTEX_REPO: https://github.com/200210xsb/artex-full.git
   # ---- frp 服务端 ----
   FRP_SERVER_ADDR: "203.195.195.52"
   # frps 的 bindPort 与 auth.token 不再写死在这里，改由 Environment secrets 注入：
@@ -119,7 +121,7 @@ jobs:
       - name: Checkout ARTEX
         uses: actions/checkout@v4
         with:
-          repository: Ruoji6/ARTEX
+          repository: 200210xsb/artex-full
           path: artex
           fetch-depth: 1
 
