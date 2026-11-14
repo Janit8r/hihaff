@@ -63,13 +63,28 @@ env:
   # nginx 边缘层端口（frpc 暴露的是它，不是 8787）
   EDGE_PORT: "8080"
   # ---- 跨轮持久化 ----
-  # 这个目录整体进 Actions 缓存：数据库转储 + ARTEX 自身数据目录。
+  # 这个目录整体进 Actions 缓存：数据库转储 + ARTEX 自身数据目录 +
+  # Webshell payload 库 + MCP 状态（模板索引 / provider-config）。
   # 下一轮先恢复它，再启动 artex，做到「接着上次跑」。
   STATE_DIR: ${{ github.workspace }}/.artex-state
   # ---- Nuclei POC 资产（artex-full 新增的常驻部署依赖）----
   NUCLEI_VERSION: "3.11.1"
   # 设为 0 可跳过 nuclei / 模板库下载（只留空目录占位：页面不报错但列表为空）
   ARTEX_NUCLEI_ASSETS: ${{ vars.ARTEX_NUCLEI_ASSETS || '1' }}
+  # ---- MCP 工具链 / Webshell payload ----
+  # server/webshell.go 的 webshellPayloadRoot() 默认取「可执行文件旁」的
+  # payloads/webshell；runner 上二进制在 /tmp、目录不存在 →
+  # GET /api/webshell/payloads 直接 500「payload 目录不存在」。
+  # 显式指到 STATE_DIR，payload 库同时随状态缓存跨轮保留。
+  ARTEX_WEBSHELL_PAYLOAD_DIR: ${{ github.workspace }}/.artex-state/payloads/webshell
+  # 五个 stdio MCP 的 Python 脚本 + subfinder 二进制放这里（独立缓存）
+  MCP_TOOLS_DIR: ${{ github.workspace }}/.artex-mcp
+  SUBFINDER_VERSION: "2.16.0"
+  # 设为 0 可跳过 MCP 注册（只铺脚本与资产，不动数据库）
+  ARTEX_MCP_REGISTER: ${{ vars.ARTEX_MCP_REGISTER || '1' }}
+  # OOB 默认不注册：runner 在 NAT 后、frp 只映射一个端口，没有公网常驻监听器，
+  # 注册了也收不到回连；要只做「页面可见」再把它设为 1。
+  ARTEX_MCP_OOB: ${{ vars.ARTEX_MCP_OOB || '0' }}
   NEXT_TELEMETRY_DISABLED: "1"
 
 jobs:
@@ -127,6 +142,15 @@ jobs:
         with:
           repository: 200210xsb/artex-full
           path: artex
+          fetch-depth: 1
+
+      # 本仓库（部署工程）也要签出：deploy/payloads/webshell 里的 payload 种子文件
+      # 要铺进 runner 的 payload 库，用来消除 /api/webshell/payloads 的 500。
+      # 与上面 ARTEX 的 checkout 用不同 path，互不覆盖。
+      - name: Checkout deployment assets
+        uses: actions/checkout@v4
+        with:
+          path: .ci-assets
           fetch-depth: 1
 
       - name: Show source revision
@@ -443,6 +467,116 @@ jobs:
             echo "save=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # ---------- 5.6 MCP 工具链资产 ----------
+      # ARTEX 本体是单二进制，「扫描 / 子域枚举 / 路径枚举 / 拿 shell」全靠
+      # 5 个外挂 stdio MCP（Python 脚本）子进程。裸 runner 上既没有脚本、
+      # 没有 subfinder，也没有往 mcp_servers / agent_visibility 写过注册记录。
+      # 这里只负责「铺文件 + 建 payload 目录」；注册单独放在 Wait for health
+      # 之后（那时 PostgreSQL 的 schema 才由 artex 启动流程建好）。
+      - name: Restore MCP toolchain cache
+        id: mcp-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.artex-mcp
+          key: artex-mcp-tools-v1-${{ env.SUBFINDER_VERSION }}
+          restore-keys: |
+            artex-mcp-tools-v1-
+
+      - name: Prepare MCP toolchain assets
+        id: mcp-assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 与 nuclei 资产步骤一致：不用 -e。资产准备任何一步失败都只降级告警，
+          # 绝不能因为「少一个扫描器」把整个部署搞挂。
+          set -uo pipefail
+          BIN="${MCP_TOOLS_DIR}/bin"
+          SRC="${GITHUB_WORKSPACE}/artex"
+          ASSETS="${GITHUB_WORKSPACE}/.ci-assets"
+          PAY="${ARTEX_WEBSHELL_PAYLOAD_DIR}"
+          mkdir -p "${BIN}" "${STATE_DIR}/mcp/nuclei-mcp" "${STATE_DIR}/data/oob" \
+                   "${PAY}/php" "${PAY}/jsp" "${PAY}/aspx" \
+            || echo "::warning::状态目录创建失败，MCP 资产可能不完整"
+
+          # 1) 五个 MCP 脚本 + 爆破字典：每轮从 checkout 覆盖，保证与源码同步；
+          #    独立缓存只为省掉 subfinder 的重复下载。
+          for spec in nuclei:nuclei_mcp.py recon:recon_mcp.py \
+                      webshell:webshell_mcp.py webpath:webpath_mcp.py oob:oob_mcp.py; do
+            d="${spec%%:*}"; f="${spec#*:}"
+            if [ -f "${SRC}/${d}/${f}" ]; then
+              install -m 0755 "${SRC}/${d}/${f}" "${BIN}/${f}" \
+                || echo "::warning::${f} 安装失败，对应 MCP 可能起不来"
+            else
+              echo "::warning::源码缺少 ${d}/${f}，对应 MCP 不会注册成功"
+            fi
+          done
+          if [ -f "${SRC}/recon/subs.txt" ]; then
+            install -m 0644 "${SRC}/recon/subs.txt" "${BIN}/subs.txt" \
+              || echo "::warning::subs.txt 安装失败"
+          else
+            echo "::warning::源码缺少 recon/subs.txt，bruteforce_enum 会用内置兜底字典"
+          fi
+          echo "MCP 脚本: $(find "${BIN}" -maxdepth 1 -name '*_mcp.py' | wc -l)/5"
+
+          # 2) subfinder：只在缓存 miss / 二进制缺失时下载一次
+          if [ ! -x "${BIN}/subfinder" ]; then
+            tmp=$(mktemp -d)
+            if gh release download "v${SUBFINDER_VERSION}" \
+                 --repo projectdiscovery/subfinder \
+                 --pattern "subfinder_${SUBFINDER_VERSION}_linux_amd64.zip" \
+                 --dir "${tmp}" 2>/dev/null \
+               && unzip -q -o "${tmp}/subfinder_${SUBFINDER_VERSION}_linux_amd64.zip" -d "${tmp}/x" \
+               && [ -f "${tmp}/x/subfinder" ]; then
+              install -m 0755 "${tmp}/x/subfinder" "${BIN}/subfinder"
+              echo "subfinder v${SUBFINDER_VERSION} 已安装"
+            else
+              echo "::warning::subfinder 下载失败；被动枚举不可用，爆破/解析/探活仍可用"
+            fi
+            rm -rf "${tmp}"
+          fi
+
+          # 3) provider-config 放 STATE_DIR 才能跨轮保留（以后填的 key 不丢），
+          #    同时每轮同步到 HOME，让 subfinder 子进程自己也读得到。
+          PC="${STATE_DIR}/mcp/subfinder-provider-config.yaml"
+          if [ ! -f "${PC}" ]; then
+            cat > "${PC}" <<'YAML'
+          # subfinder 被动源 key；留空只用无 key 的源。
+          # 格式必须保持 "hunter:" 顶格 + 缩进 "- key"，recon_mcp.py 按此解析。
+          chaos: []
+          fofa:
+            - ""
+          hunter:
+            - ""
+          quake: []
+          YAML
+          fi
+          mkdir -p "${HOME}/.config/subfinder"
+          install -m 0600 "${PC}" "${HOME}/.config/subfinder/provider-config.yaml"
+
+          # 4) Webshell payload 根目录：只要目录存在，
+          #    webshellPayloadEntries() 就从 500 变成 200 + 空列表。
+          #    种子文件来自本仓库 deploy/payloads/webshell/，每轮覆盖同名文件；
+          #    其余文件一律保留，用户放进来的 payload 随 STATE_DIR 缓存跨轮存活。
+          if [ -d "${ASSETS}/deploy/payloads/webshell" ]; then
+            cp -a "${ASSETS}/deploy/payloads/webshell/." "${PAY}/" \
+              || echo "::warning::payload 种子同步失败，但目录仍在，接口不会 500"
+          else
+            echo "::warning::未找到 deploy/payloads/webshell，payload 库保持空目录"
+          fi
+          echo "payload 库 ${PAY}: $(find "${PAY}" -type f \( -name '*.php' -o -name '*.jsp' -o -name '*.aspx' \) | wc -l) 个条目"
+          # 只有 subfinder 真正在位才写缓存：下载失败时不写空缓存，下一轮会重试
+          if [ -x "${BIN}/subfinder" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save MCP toolchain cache
+        if: steps.mcp-cache.outputs.cache-hit != 'true' && steps.mcp-assets.outputs.ready == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.artex-mcp
+          key: artex-mcp-tools-v1-${{ env.SUBFINDER_VERSION }}
+
       - name: Save nuclei assets cache
         if: steps.nuclei-cache.outputs.cache-hit != 'true' && steps.nuclei-prepare.outputs.save == 'true'
         continue-on-error: true
@@ -486,6 +620,107 @@ jobs:
             fi
           done
           curl -sS -m 5 "http://127.0.0.1:8787/api/health" || true
+
+      # ---------- 6.1 注册 MCP 服务器 ----------
+      # 必须放在 Wait for health 之后：mcp_servers / agents / agent_visibility
+      # 三张表是 artex 启动时执行 db/schema.sql 建的，注册脚本要往里写。
+      # 注册结果存在 PostgreSQL 里，随 db.sql.gz 快照跨轮保留；
+      # 各 register-mcp.sh 用 ON CONFLICT (name) DO UPDATE，重跑幂等。
+      - name: Register MCP servers
+        if: ${{ env.ARTEX_MCP_REGISTER != '0' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TOOLS="${MCP_TOOLS_DIR}/bin"
+          SRC="${GITHUB_WORKSPACE}/artex"
+          PAY="${ARTEX_WEBSHELL_PAYLOAD_DIR}"
+
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client >/dev/null
+          fi
+          ready=0
+          for i in $(seq 1 20); do
+            if psql "${ARTEX_PG_DSN}" -tAc 'select 1' >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          if [ "${ready}" -ne 1 ]; then
+            echo "::warning::PostgreSQL 未就绪，跳过 MCP 注册（不影响 Web 服务）"
+            exit 0
+          fi
+
+          # 单个注册失败只告警，不阻断上线，也不影响其它 MCP
+          reg() {
+            local label="$1"; shift
+            if "$@" > "/tmp/register-${label}.log" 2>&1; then
+              echo "✓ ${label} 已注册"
+              tail -2 "/tmp/register-${label}.log" || true
+            else
+              echo "::warning::${label} 注册失败（不影响上线）："
+              tail -15 "/tmp/register-${label}.log" >&2 || true
+            fi
+          }
+
+          # 注意：nuclei/register-mcp.sh 的 build_env_sql() 在带 --env 时会拼出
+          #   jsonb_build_object('KEY',,'VALUE')  ← 双逗号，非法 SQL
+          # （上游脚本把 "," 写进了数组元素里，再被 IFS=, 拼一次）。
+          # 所以这里不传 --env，额外的 env 键统一在下面用 SQL 覆写。
+          reg Nuclei bash "${SRC}/nuclei/register-mcp.sh" \
+            --mcp-path "${TOOLS}/nuclei_mcp.py" \
+            --bin "/opt/artex/bin/nuclei" \
+            --templates "/opt/artex/nuclei-templates"
+
+          reg Subfinder bash "${SRC}/recon/register-mcp.sh" \
+            --mcp-path "${TOOLS}/recon_mcp.py" \
+            --bin "${TOOLS}/subfinder" \
+            --wordlist "${TOOLS}/subs.txt" \
+            --provider-config "${STATE_DIR}/mcp/subfinder-provider-config.yaml" \
+            --env "ARTEX_RECON_LOG=/tmp/subfinder-mcp.log"
+
+          reg Webshell bash "${SRC}/webshell/register-mcp.sh" \
+            --mcp-path "${TOOLS}/webshell_mcp.py" \
+            --store "${STATE_DIR}/data/webshells.json" \
+            --payload-dir "${PAY}" \
+            --env "ARTEX_DATA_DIR=${STATE_DIR}/data" \
+            --env "ARTEX_WEBSHELL_LOG=/tmp/webshell-mcp.log"
+
+          reg WebPath bash "${SRC}/webpath/register-mcp.sh" \
+            --mcp-path "${TOOLS}/webpath_mcp.py"
+
+          # 统一覆写额外 env 键（避开上面 nuclei 脚本的 --env bug）：
+          #  - Nuclei 模板索引放 STATE_DIR，14k 模板建一次索引后跨轮复用；
+          #  - WebPath 的注册脚本把 WEBPATH_LOG 写死成 <脚本路径>.log，改到 /tmp
+          #    免得污染缓存目录；顺便显式锁定录制代理地址。
+          # 日志与索引都指到可写目录，任何一条失败只告警，不影响注册结果。
+          psql "${ARTEX_PG_DSN}" -v ON_ERROR_STOP=1 -q \
+            -c "UPDATE mcp_servers SET env = env || jsonb_build_object('ARTEX_NUCLEI_INDEX','${STATE_DIR}/mcp/nuclei-mcp','ARTEX_NUCLEI_LOG','/tmp/nuclei-mcp.log') WHERE name = 'Nuclei'; UPDATE mcp_servers SET env = env || jsonb_build_object('WEBPATH_LOG','/tmp/webpath-mcp.log','WEBPATH_CAPTURE_PROXY','http://127.0.0.1:8788') WHERE name = 'WebPath';" \
+            >/dev/null 2>&1 \
+            || echo "::warning::MCP env 覆写失败（各服务仍可用，只是索引/日志走默认路径）"
+
+          if [ "${ARTEX_MCP_OOB}" = "1" ]; then
+            reg OOB bash "${SRC}/oob/register-mcp.sh" \
+              --mcp-path "${TOOLS}/oob_mcp.py" \
+              --db "${STATE_DIR}/data/oob/oob.db"
+            echo "::notice::OOB 已注册，但 runner 在 NAT 后且 frp 只映射 ${FRP_REMOTE_PORT}，真实回连仍不可用"
+          else
+            echo "OOB 未注册（ARTEX_MCP_OOB=0）：缺公网常驻监听器，注册了也收不到回连"
+          fi
+
+          echo "----- mcp_servers -----"
+          psql "${ARTEX_PG_DSN}" -tAc \
+            "select name || ' enabled=' || enabled || ' cmd=' || coalesce(command,'')
+               from mcp_servers
+              where name in ('Nuclei','Subfinder','WebPath','Webshell','OOB')
+              order by name" || true
+          {
+            echo ""
+            echo "### MCP 工具链"
+            echo ""
+            echo "- 已注册：\`Nuclei / Subfinder / WebPath / Webshell\`；OOB：\`${ARTEX_MCP_OOB}\`"
+            echo "- 工具发现：页面「系统 → MCP」点「刷新」，或让 agent 领一条意图后写入 \`mcp_tools_cache\`"
+            echo "- Webshell payload 目录：\`${PAY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------- 边缘层：nginx 直接托管静态资源 + gzip_static + 长缓存 ----------
       # 目的：1) 静态文件不经 Go，省一次转发；2) .gz 直接吐，1.29MB → ~515KB；

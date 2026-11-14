@@ -16,6 +16,9 @@ GitHub Actions runner (ubuntu-latest, 临时)
 ├── postgres:16-alpine   (job service, 127.0.0.1:5432)
 ├── artex  :8787         (go build -tags embedui，内嵌前端)
 │         :8788          (MITM 流量记录代理，仅本地)
+├── .artex-mcp/bin       (5 个 stdio MCP 脚本 + subfinder，注册进 mcp_servers)
+├── .artex-state/        (db 快照 / data / payloads/webshell / MCP 模板索引)
+├── /opt/artex -> .artex-nuclei (nuclei 二进制 + 模板库，Go 常量路径)
 ├── nginx  :8080         (边缘层：托管静态资源 + gzip_static + 长缓存，/api 反代 8787)
 └── frpc ── TCP ──> 203.195.195.52:7023 (frps)
                      └── remotePort 18087 ──> 公网
@@ -193,6 +196,8 @@ gh secret list --env production --repo Janit8r/hihaff
 | `FRP_REMOTE_PORT` | `18087` | 公网访问端口，须在 frps `allowPorts` 内 |
 | `ARTEX_LLM_PROVIDER` / `ARTEX_LLM_MODEL` / `ARTEX_LLM_BASE_URL` | 空 | LLM 接入点 |
 | `ARTEX_NUCLEI_ASSETS` | `1` | 设成 `0` 跳过 nuclei / 模板库下载（只留空目录占位） |
+| `ARTEX_MCP_REGISTER` | `1` | 设成 `0` 跳过 MCP 注册（只铺脚本与资产，不动数据库） |
+| `ARTEX_MCP_OOB` | `0` | 设成 `1` 才注册 OOB MCP；**仅让页面可见，真实回连仍不可用**，见下 |
 
 ### Nuclei POC 模板库（切到 artex-full 后新增的依赖）
 
@@ -228,6 +233,63 @@ gh secret list --env production --repo Janit8r/hihaff
 `key: artex-nuclei-v1-<版本>`（版本进 key 才能触发重新下载）。
 不想付这个代价就把 Variable `ARTEX_NUCLEI_ASSETS` 设为 `0`。
 
+### MCP 工具链（Subfinder / WebPath / Webshell / Nuclei）
+
+`artex-full` 的扫描、子域枚举、路径枚举、拿 shell 能力**不在二进制里**，由 5 个外挂
+stdio MCP（纯标准库 Python）子进程提供。`db/schema.sql` 只 seed 一条 `ScopeSentry`
+（`enabled=false`）；此前工作流完全没有安装/注册步骤，所以「系统 → MCP」是空的、
+agent 手里没有工具。
+
+补齐后的步骤：
+
+| 步骤 | 作用 |
+|---|---|
+| `Checkout deployment assets` | 把本仓库签出到 `.ci-assets`，取 `deploy/payloads/webshell/` 种子；与 ARTEX 的 checkout 路径不同，互不覆盖 |
+| `Restore / Save MCP toolchain cache` | 固定 key `artex-mcp-tools-v1-2.16.0`，跨轮复用 subfinder 二进制 |
+| `Prepare MCP toolchain assets` | 从 ARTEX checkout 铺 5 个 `*_mcp.py` + `subs.txt`；下载 subfinder v2.16.0；生成 provider-config；建 payload 目录 |
+| `Register MCP servers` | 跑官方 `*/register-mcp.sh`，写 `mcp_servers` + `agent_visibility` |
+
+**注册必须放在 `Wait for health` 之后**：`mcp_servers` / `agents` / `agent_visibility`
+是 artex 启动时执行 `db/schema.sql` 才建的表。注册结果存在 PostgreSQL 里，随
+`db.sql.gz` 快照跨轮保留；脚本用 `ON CONFLICT (name) DO UPDATE`，每轮重跑幂等
+（注意：这会重新置 `enabled=true`，页面里手动禁用的服务下一轮会被再次启用）。
+
+> 踩过的坑：上游 `nuclei/register-mcp.sh` 的 `build_env_sql()` 在带 `--env` 时会拼出
+> `jsonb_build_object('KEY',,'VALUE')` 这种**双逗号非法 SQL**（数组元素里自带逗号，
+> 又被 `IFS=,` 拼了一次）。本地模拟抓到后，工作流不给它传 `--env`；Nuclei 的模板索引 /
+> 日志路径与 WebPath 的日志 / 代理地址统一用一条
+> `UPDATE mcp_servers SET env = env || jsonb_build_object(...)` 覆写，绕开这个 bug。
+
+| MCP | 状态 | 说明 |
+|---|---|---|
+| Nuclei | ✅ | 指向 `/opt/artex/bin/nuclei` + `/opt/artex/nuclei-templates`；14k 模板的索引放 `STATE_DIR/mcp/nuclei-mcp`，跨轮复用。`poc_update` 因模板库是 codeload tarball（无 `.git`）不可用 |
+| Subfinder | ✅ | `subfinder` v2.16.0 + `subs.txt`；`subfinder_enum` / `bruteforce_enum` / `dns_resolve` / `http_probe` 无需 key，`hunter_enum` 等要 provider-config 里的 key |
+| WebPath | ✅ | 纯标准库，走已有的 `127.0.0.1:8788` 录制代理；缺 CA 证书时自动直连 |
+| Webshell | ✅ | 会话库与页面共用 `STATE_DIR/data/webshells.json`；payload 目录见下一节 |
+| OOB | ❌ 默认不注册 | runner 在 NAT 后、frp 只映射 `18087`，没有公网常驻监听器与 `8889/18666/18667`（甚至 53/UDP）；`ARTEX_MCP_OOB=1` 只让页面可见，真实回连仍收不到 |
+
+工具列表不会在注册瞬间出现：MCP 是「随 agent 意图 spawn」的。想立刻看到，去页面
+「系统 → MCP」点某个服务的**刷新**（`pgRefreshMCP` 会重新发现并写 `mcp_tools_cache`），
+或让 agent 领一条意图。
+
+#### Webshell payload 库 500 已修
+
+`server/webshell.go` 的 `webshellPayloadRoot()` 默认取「可执行文件旁的
+`payloads/webshell`」，runner 上二进制在 `/tmp` 且没有这个目录，于是
+`GET /api/webshell/payloads` 直接 500 `payload 目录不存在: ...`。
+现在用 `ARTEX_WEBSHELL_PAYLOAD_DIR` 指到 `${STATE_DIR}/payloads/webshell`，
+`Prepare MCP toolchain assets` 建出 `php/ jsp/ aspx/` 三个子目录并同步
+`deploy/payloads/webshell/` 的种子 → 接口返回 200 + 3 条探针。
+
+- 上游**不分发**真实 payload（"可直接落地的马不入库"）。本仓库只放 3 个
+  **无命令执行能力的连通性探针**（回显一个标记），用来验证挂载、检索、读取与
+  元信息解析链路；需要真实 payload 请按 `<类型>/<文件名>.<类型>` 自己放进
+  `deploy/payloads/webshell/`，push 会触发新一轮部署。格式见该目录的 README。
+- 同名种子每轮覆盖，其它文件一律保留；整个目录随 `.artex-state` 缓存跨轮保留，
+  不会每轮清空。
+- Webshell 页面侧（会话 CRUD / exec / upload / download）本来就是纯 Go 实现，
+  会话库也随状态缓存保留，不依赖 MCP 即可使用。
+
 ## 3. 落地工作流
 
 把 `.github/workflows/deploy-artex-frp.yml` 放到 hihaff 仓库，二选一：
@@ -260,16 +322,20 @@ git push -u origin main
 
 ```bash
 # 触发：Actions → artex-deploy-frp → Run workflow
-# 或 push 后自动触发；此后每 6 小时 cron 自动续期
+# 或 push 后自动触发；此后靠「Queue successor run」自我续期（cron 只作兜底，见第 5 节）
 
 # 公网验证（frps 所在网络或任意外网）
 curl -sS -o /dev/null -w '%{http_code}\n' http://203.195.195.52:18087/
 curl -sS http://203.195.195.52:18087/api/health
 ```
 
-Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址与凭据来源（Environment secrets），
-以及「跨轮持久化」块的恢复来源 / 数据库恢复状态 / public 表数量；
-`Wait for health`、`Start frpc`、`Keep alive` 三步的日志里能看到探活与 frp 握手结果。
+Job 首页 Summary 会打印公网地址、ARTEX commit、frps 地址与凭据来源（Environment secrets）、
+「跨轮持久化」块的恢复来源 / 数据库恢复状态 / public 表数量，以及「MCP 工具链」块
+（已注册服务、OOB 开关、Webshell payload 目录）。
+`Wait for health`、`Start frpc`、`Keep alive` 三步的日志里能看到探活与 frp 握手结果；
+`Prepare MCP toolchain assets` 会打印 `MCP 脚本: 5/5` 和 `payload 库 ... 个条目`，
+`Register MCP servers` 会打印 `mcp_servers` 清单。登录后到「功能 → WebShell → Payload 库」
+应看到 3 条探针，到「系统 → MCP」应看到 4 个已启用服务。
 
 ## 5. 在线保障：自我续期（不依赖 GitHub 定时调度）
 
@@ -355,6 +421,14 @@ GitHub 保证同一组最多 1 running + 1 pending，不会堆积；稳态就是
 | 日志 `unrecognized configuration parameter "transaction_timeout"` | pg_dump 18 导出的 dump 头含 PG18 专有 GUC，PG16 服务端不认 | 工作流已自动过滤并重试；若仍失败，把 service 镜像升到 `postgres:18-alpine` 或看下一行 |
 | 页面报 `模板目录不可用: /opt/artex/nuclei-templates` | artex-full 把 nuclei / 模板库路径写成 Go 常量，runner 上默认没有；或 `Prepare nuclei POC assets` 的下载失败 | 看该步骤日志里的 `模板文件数`；正常首次下载后应有数千个 yaml。仍为 0 就检查 codeload / release 是否被网络拦，或手动触发新一轮重试 |
 | POC 模板列表为空但不报错 | 模板库下载被降级（目录存在、内容为空），或 `ARTEX_NUCLEI_ASSETS=0` | 确认 Variable 不是 `0`；删除缓存 `artex-nuclei-v1-3.11.1` 后重跑一轮强制重新下载 |
+| `payload 目录不存在` / WebShell 页 Payload 库 500 | 旧版没设 `ARTEX_WEBSHELL_PAYLOAD_DIR`，`webshellPayloadRoot()` 指向不存在的目录 | 看 `Prepare MCP toolchain assets` 日志里的 `payload 库 ... 个条目`；正常应有 `php/ jsp/ aspx/` 三个子目录 |
+| Payload 库返回 200 但条目为 0 | 种子未签出（`.ci-assets` 缺失）或文件后缀与目录名不匹配 | 必须是 `php/*.php`、`jsp/*.jsp`、`aspx/*.aspx`；检查 `deploy/payloads/webshell/` 是否已 push |
+| 「系统 → MCP」里看不到 Nuclei/Subfinder/WebPath/Webshell | `Register MCP servers` 被跳过或失败；或 Variable `ARTEX_MCP_REGISTER=0` | 看该步骤日志的 `mcp_servers` 清单；注册依赖 `Wait for health` 之后才有的表，且 `psql` 由该步骤自动安装 |
+| MCP 服务已启用但工具数是 0 | 工具列表是「随 agent 意图 spawn」后才缓存的 | 页面「系统 → MCP」点「刷新」，或让 agent 领一条意图 |
+| `subfinder 下载失败` 告警 | release 下载被网络拦 | 只影响 `subfinder_enum`；爆破/解析/探活仍可用。删缓存 `artex-mcp-tools-v1-2.16.0` 后重跑重试 |
+| agent 调 `hunter_enum` 报没有 key | provider-config 里的 `hunter:` 为空 | 该文件在 `STATE_DIR/mcp/subfinder-provider-config.yaml`，runner 上无法直接编辑；要固定 key 建议常驻部署（第 7 节） |
+| `poc_update` 报不是 git 仓库 | 模板库用 codeload tarball，没有 `.git` | 属预期；只为省 ~50MB 缓存。要可 pull 就改成 `git clone --depth 1`，代价是缓存翻倍 |
+| OOB 页面 `available:false` / 收不到回连 | runner 在 NAT 后、frp 只映射 `18087`，没有公网常驻监听器 | **补不齐**：需要公网 IP/域名 + 8889/18666/18667（甚至 53/UDP）；见第 7 节常驻部署 |
 | `::error::数据库快照恢复失败，本轮中止` | 快照损坏 / 版本差异过大，工作流故意中止以免覆盖好数据 | 用 Run workflow 的 `state_cache_key` 指定更早的快照；必要时删掉那份坏缓存 |
 | Summary 里 `public 表数量: 0` | 恢复被跳过（无快照）或恢复了空库 | 检查缓存是否命中、dump 是否非空；坏快照用 `state_cache_key` 回滚 |
 
@@ -373,6 +447,10 @@ cp -a skills/. /opt/artex/skills/
 cd /path/to/artex-full && ./mcp/install-mcp.sh --only nuclei --no-register
 # 等价于：下载 nuclei v3.11.1 到 /opt/artex/bin/nuclei，
 #        git clone --depth 1 projectdiscovery/nuclei-templates → /opt/artex/nuclei-templates
+
+# 常驻主机上可以一次装齐 5 个 MCP 并注册（OOB 还要先按 oob/README.md 起监听器）：
+cd /path/to/artex-full && ./mcp/install-mcp.sh
+# payload 库放 /opt/artex/payloads/webshell/<php|jsp|aspx>/，无需 ARTEX_WEBSHELL_PAYLOAD_DIR
 
 export ARTEX_PG_DSN='postgres://artex:pw@127.0.0.1:5432/artex?sslmode=disable'
 export ARTEX_SKILL_DIR=/opt/artex/skills
