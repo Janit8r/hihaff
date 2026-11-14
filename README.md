@@ -198,6 +198,8 @@ gh secret list --env production --repo Janit8r/hihaff
 | `ARTEX_NUCLEI_ASSETS` | `1` | 设成 `0` 跳过 nuclei / 模板库下载（只留空目录占位） |
 | `ARTEX_MCP_REGISTER` | `1` | 设成 `0` 跳过 MCP 注册（只铺脚本与资产，不动数据库） |
 | `ARTEX_MCP_OOB` | `0` | 设成 `1` 才注册 OOB MCP；**仅让页面可见，真实回连仍不可用**，见下 |
+| `ARTEX_ENGLISH_DEFAULTS` | `1` | 设成 `0` 完全关掉英文补丁，回到上游中文内置模板/提示词 |
+| `ARTEX_ENGLISH_DEFAULTS_FORCE` | `0` | 设成 `1` 强制重跑一次数据库英文化迁移（会覆盖用户手改的提示词） |
 
 ### Nuclei POC 模板库（切到 artex-full 后新增的依赖）
 
@@ -289,6 +291,48 @@ agent 手里没有工具。
   不会每轮清空。
 - Webshell 页面侧（会话 CRUD / exec / upload / download）本来就是纯 Go 实现，
   会话库也随状态缓存保留，不依赖 MCP 即可使用。
+
+### 英文默认：ARTEX 内部 agent ↔ LLM 的消息全量英文化
+
+> 范围只针对 **ARTEX 内部 agent 与 LLM 之间的消息**（系统提示词、内置任务模板、
+> 运行时注入的规约、收尾词、报告模板）。我们之间在 WorkBuddy 里的对话不受影响。
+> 起因是部分模型不支持中文，中文 system prompt 会让这些模型输出异常。
+
+只改数据库**不够**，中文来自三层，工作流分别处理：
+
+| 层 | 中文来源 | 处理方式 |
+|---|---|---|
+| ① 内置提示词 | `agent/*.go` 的 11 个常量：`goalsDefaultTmpl`、`plannerDefaultTmpl`、`mainAgentDefaultTmpl`、`workerDefaultTmpl`、`autoDefaultTmpl`、`pentestDefaultTmpl`、`redteamDefaultTmpl`、`goalsScopeTail`、`assetCollectionRule`、`DefaultAssistantPrompt`、`ReporterDefaultPrompt` | 构建前按**常量名**整体替换成完整英文版，并在 9 个完整 system prompt 末尾追加 `LANGUAGE_POLICY`（最高优先级：所有推理、TodoWrite、工具参数、结论、报告一律英文；上下文里的中文只当证据数据） |
+| ② 代码固定注入片段 | `worker.go` 的流量/出口/上报门槛、`planner.go` 的态势与唤醒块、`wrapup.go` 的收尾词、`constraints.go` 的操作约束、`finding_workflow.go` 的编号与证据规约等 ~100 个中文字符串 | 构建前按**内容哈希**替换整个 Go 字符串字面量；这些片段是代码拼在 DB 正文之后的**段 [B]/[C]**，后台页面里根本改不掉 |
+| ③ 内置任务模板 | `db/task_templates_seed.json` 的 7 个模板（名称/描述/目标） | 构建前改写嵌入的 JSON；`nkey` **原样保留**，含 `web 渗透`、`攻防演练` 这两个中文内部键 |
+
+配套的两个工作流步骤：
+
+- `Apply English defaults to ARTEX source`（`Show source revision` 之后、`go build` 之前）
+  执行 `deploy/i18n/en/apply_en.py`，同时产出 `${I18N_DIR}/en_defaults.sql`。
+- `Apply English defaults to persisted DB`（`Wait for health` 之后）
+  执行该 SQL。`agent.PromptOverride` 让 **DB 正文优先于代码默认**，所以老库里
+  已经播种的中文 `agent_prompts` / `task_templates` 必须显式改写，否则源码补丁无效。
+
+幂等与安全性：
+
+- 数据库迁移是**一次性**的：`settings.artex_i18n_en_v1` 置位后，所有 `UPDATE`
+  都会跳过。续期轮每 ~5.5 小时跑一次，但不会反复覆盖用户后来在后台手改的提示词。
+  要重置就把 `ARTEX_ENGLISH_DEFAULTS_FORCE` 设为 `1` 跑一轮（会覆盖手改内容）。
+- 自定义 agent 不是内置模板：保留其正文，仅在末尾追加 `LANGUAGE_POLICY`。
+- `agents.wrapup_prompt` / `task_timeout_wrapup_prompt` 为空时不动，直接用
+  已经英文化过的代码默认值；非空且仍是中文才改写。
+- 补丁失败只告警、不阻断上线；此时删掉半成品 SQL，避免把半写好的迁移灌进数据库。
+- 校验：`apply_en.py` 会扫描打完补丁的 `agent/*.go`，要求**中文字符串字面量为 0**，
+  并检查 Go 词法状态（防替换出未闭合的字符串导致 `go build` 失败）。
+  `db/*.go`、`server/*.go` 里剩下的中文是界面标签 / 日志文案，不会进入 LLM 消息。
+
+资源文件：`deploy/i18n/en/` 下
+`prompts_en.py`（11 个完整英文提示词 + 语言策略）、
+`templates_en.py`（7 个英文任务模板）、
+`strings_en.py`（代码固定片段英译 + 英文收尾词）、
+`apply_en.py`（补丁器 + SQL 生成器）。上游改了文案时，哈希不匹配会打
+`::warning::` 并在 Summary 里列出，不会静默把中文放回提示词。
 
 ## 3. 落地工作流
 
@@ -429,6 +473,9 @@ GitHub 保证同一组最多 1 running + 1 pending，不会堆积；稳态就是
 | agent 调 `hunter_enum` 报没有 key | provider-config 里的 `hunter:` 为空 | 该文件在 `STATE_DIR/mcp/subfinder-provider-config.yaml`，runner 上无法直接编辑；要固定 key 建议常驻部署（第 7 节） |
 | `poc_update` 报不是 git 仓库 | 模板库用 codeload tarball，没有 `.git` | 属预期；只为省 ~50MB 缓存。要可 pull 就改成 `git clone --depth 1`，代价是缓存翻倍 |
 | OOB 页面 `available:false` / 收不到回连 | runner 在 NAT 后、frp 只映射 `18087`，没有公网常驻监听器 | **补不齐**：需要公网 IP/域名 + 8889/18666/18667（甚至 53/UDP）；见第 7 节常驻部署 |
+| 后台「Agent」提示词 / 任务模板仍是中文 | 数据库是缓存里恢复的老库，`SeedPromptIfEmpty` / `ON CONFLICT (nkey) DO NOTHING` 不会覆盖旧行；或 `ARTEX_ENGLISH_DEFAULTS=0` | 看 `Apply English defaults to persisted DB` 步骤日志；正常应有 `✓ 持久化数据库已应用英文默认` 与 `builtin_agent_prompts_english=7/7`。若迁移门已置位但仍是中文（例如手动改回），把 `ARTEX_ENGLISH_DEFAULTS_FORCE` 设 `1` 重跑一轮 |
+| agent 仍用中文回复 | ① LLM 不遵循 `LANGUAGE_POLICY`；② 用了自定义 agent / 自定义模板；③ 上游新增了没翻译的中文片段 | 先看 `Apply English defaults to ARTEX source` Summary 里 `Chinese literals in agent/ ... 0` 与 `unmatched known hashes ... 0`；自定义模板正文需自己改英文，或确认已追加 `LANGUAGE POLICY (highest priority` |
+| `::warning::...did not match upstream` / `Chinese literals in agent/ > 0` | 上游 `200210xsb/artex-full` 改了提示词文案，内容哈希对不上 | 不会静默放回中文：按 Summary 列出的片段补进 `deploy/i18n/en/strings_en.py` 后重新 push；补丁失败只告警，服务仍会用上游默认值上线 |
 | `::error::数据库快照恢复失败，本轮中止` | 快照损坏 / 版本差异过大，工作流故意中止以免覆盖好数据 | 用 Run workflow 的 `state_cache_key` 指定更早的快照；必要时删掉那份坏缓存 |
 | Summary 里 `public 表数量: 0` | 恢复被跳过（无快照）或恢复了空库 | 检查缓存是否命中、dump 是否非空；坏快照用 `state_cache_key` 回滚 |
 
@@ -451,6 +498,13 @@ cd /path/to/artex-full && ./mcp/install-mcp.sh --only nuclei --no-register
 # 常驻主机上可以一次装齐 5 个 MCP 并注册（OOB 还要先按 oob/README.md 起监听器）：
 cd /path/to/artex-full && ./mcp/install-mcp.sh
 # payload 库放 /opt/artex/payloads/webshell/<php|jsp|aspx>/，无需 ARTEX_WEBSHELL_PAYLOAD_DIR
+
+# 英文默认：常驻部署不走 Actions，需要自己先打源码补丁再编译，
+# 并在服务启动后对已有的库执行一次生成的 SQL：
+python3 deploy/i18n/en/apply_en.py --src /path/to/artex-full \
+  --sql-out /tmp/en_defaults.sql --report-out /tmp/en_report.json
+# 然后 go build -tags embedui ...；服务就绪后：
+psql "$ARTEX_PG_DSN" -v ON_ERROR_STOP=1 -q -f /tmp/en_defaults.sql
 
 export ARTEX_PG_DSN='postgres://artex:pw@127.0.0.1:5432/artex?sslmode=disable'
 export ARTEX_SKILL_DIR=/opt/artex/skills

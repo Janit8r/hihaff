@@ -85,6 +85,15 @@ env:
   # OOB 默认不注册：runner 在 NAT 后、frp 只映射一个端口，没有公网常驻监听器，
   # 注册了也收不到回连；要只做「页面可见」再把它设为 1。
   ARTEX_MCP_OOB: ${{ vars.ARTEX_MCP_OOB || '0' }}
+  # ---- 英文默认（只作用于 ARTEX 内部 agent ↔ LLM 的消息）----
+  # 上游内置 agent 提示词 / 任务模板 / 代码固定注入的提示片段全是中文；
+  # 部分模型不支持中文，所以在 go build 前打一层英文补丁，并在服务就绪后
+  # 把已经持久化的旧数据库行也改成英文。设成 0 可完全回到上游中文默认值。
+  ARTEX_ENGLISH_DEFAULTS: ${{ vars.ARTEX_ENGLISH_DEFAULTS || '1' }}
+  # 数据库迁移默认对每个持久化库只跑一次（settings.artex_i18n_en_v1 置位）。
+  # 设成 1 会强制重新覆盖一次，用于上游模板更新或人工改回中文后重置。
+  ARTEX_ENGLISH_DEFAULTS_FORCE: ${{ vars.ARTEX_ENGLISH_DEFAULTS_FORCE || '0' }}
+  I18N_DIR: ${{ github.workspace }}/.artex-i18n
   NEXT_TELEMETRY_DISABLED: "1"
 
 jobs:
@@ -159,6 +168,48 @@ jobs:
           commit=$(git rev-parse HEAD)
           echo "ARTEX_COMMIT=${commit}" >> "$GITHUB_ENV"
           echo "ARTEX 源码 commit: ${commit}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 1.1 英文默认：编译前改源码 ----------
+      # 三层都要改，只改数据库不够：
+      #   ① agent/*.go 的 11 个内置提示词常量（agent_prompts 的种子 / render 兜底）；
+      #   ② agent/*.go 里代码固定拼在 system prompt 后面的中文片段（worker 流量规约、
+      #      上报门槛、planner 态势块、wrapup 收尾词…），它们不入库、UI 里改不掉；
+      #   ③ db/task_templates_seed.json 的 7 个内置任务模板（nkey 必须原样保留，
+      #      含「web 渗透」「攻防演练」这两个中文内部键，改了会被上游重新播种中文原文）。
+      # 同时产出 en_defaults.sql，留给服务就绪后的「Apply English defaults to
+      # persisted DB」步骤执行 —— 老库里的 agent_prompts / task_templates 是
+      # ON CONFLICT DO NOTHING / SeedPromptIfEmpty 播种的，光改源码不会覆盖旧行。
+      - name: Apply English defaults to ARTEX source
+        if: ${{ env.ARTEX_ENGLISH_DEFAULTS != '0' }}
+        run: |
+          set -uo pipefail
+          mkdir -p "${I18N_DIR}"
+          FORCE=""
+          if [ "${ARTEX_ENGLISH_DEFAULTS_FORCE}" = "1" ]; then FORCE="--force"; fi
+          if python3 "${GITHUB_WORKSPACE}/.ci-assets/deploy/i18n/en/apply_en.py" \
+               --src "${GITHUB_WORKSPACE}/artex" \
+               --sql-out "${I18N_DIR}/en_defaults.sql" \
+               --report-out "${I18N_DIR}/report.json" \
+               ${FORCE} > "${I18N_DIR}/apply.log" 2>&1; then
+            echo "✓ 源码英文补丁完成"
+            patch_ok=1
+          else
+            echo "::warning::源码英文补丁失败，本轮沿用上游默认值（不影响服务上线）"
+            # 避免把半写好的迁移文件应用到数据库
+            rm -f "${I18N_DIR}/en_defaults.sql"
+            patch_ok=0
+          fi
+          cat "${I18N_DIR}/apply.log" || true
+          {
+            echo ""
+            echo "### English defaults (source)"
+            echo ""
+            echo "- \`ARTEX_ENGLISH_DEFAULTS=${ARTEX_ENGLISH_DEFAULTS}\` / force=\`${ARTEX_ENGLISH_DEFAULTS_FORCE}\`"
+            echo "- 补丁结果：\`${patch_ok}\`（1=成功）"
+            echo '```'
+            cat "${I18N_DIR}/apply.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------- 2. 前端静态导出 ----------
       - name: Setup Node 22
@@ -620,6 +671,66 @@ jobs:
             fi
           done
           curl -sS -m 5 "http://127.0.0.1:8787/api/health" || true
+
+      # ---------- 6.0 英文默认：覆盖已持久化的旧数据库行 ----------
+      # 必须放在 Wait for health 之后：schema.sql 是 artex 启动时执行的，
+      # agent_prompts / agents / task_templates / settings 这几张表此刻才存在。
+      # agent.PromptOverride 让 DB 正文优先于代码默认，所以只打源码补丁对老库无效。
+      # 迁移是「一次性」的：settings.artex_i18n_en_v1 置位后所有 UPDATE 自动跳过，
+      # 之后用户在后台自行编辑的提示词不会被每 5.5 小时的续期轮反复覆盖。
+      - name: Apply English defaults to persisted DB
+        if: ${{ env.ARTEX_ENGLISH_DEFAULTS != '0' }}
+        run: |
+          set -uo pipefail
+          SQL="${I18N_DIR}/en_defaults.sql"
+          if [ ! -s "${SQL}" ]; then
+            echo "::warning::未生成 en_defaults.sql（源码补丁可能失败），跳过数据库英文化"
+            exit 0
+          fi
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client >/dev/null
+          fi
+          ready=0
+          for i in $(seq 1 20); do
+            if psql "${ARTEX_PG_DSN}" -tAc 'select 1' >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          if [ "${ready}" -ne 1 ]; then
+            echo "::warning::PostgreSQL 未就绪，跳过数据库英文化（不影响 Web 服务）"
+            exit 0
+          fi
+          if psql "${ARTEX_PG_DSN}" -v ON_ERROR_STOP=1 -q -f "${SQL}" \
+               > /tmp/en-defaults-psql.log 2>&1; then
+            echo "✓ 持久化数据库已应用英文默认"
+            db_ok=1
+          else
+            echo "::warning::英文默认迁移失败（服务不受影响，源码补丁仍然生效）："
+            tail -20 /tmp/en-defaults-psql.log >&2 || true
+            db_ok=0
+          fi
+          echo "----- 英文默认校验 -----"
+          psql "${ARTEX_PG_DSN}" -tAc \
+            "select 'builtin_agent_prompts_english=' ||
+                    sum(case when position('LANGUAGE POLICY (highest priority' in p.template_text)>0
+                             then 1 else 0 end) || '/' || count(*)
+               from agents a join agent_prompts p on p.id=a.current_prompt_id
+              where a.builtin" || true
+          # 只读校验：正则失败也只是一条告警，不会阻断迁移结果
+          psql "${ARTEX_PG_DSN}" -tAc \
+            "select 'task_templates_still_chinese=' || count(*) from task_templates
+              where goal ~ '[一-龥]'" || true
+          psql "${ARTEX_PG_DSN}" -tAc \
+            "select 'migration_gate=' || coalesce((select value from settings
+              where key='artex_i18n_en_v1'),'unset')" || true
+          {
+            echo ""
+            echo "### English defaults (persisted DB)"
+            echo ""
+            echo "- 迁移结果：\`${db_ok}\`（1=成功）；force=\`${ARTEX_ENGLISH_DEFAULTS_FORCE}\`"
+            echo "- 幂等门：\`settings.artex_i18n_en_v1\`，只在首次（或 force=1）覆盖，"
+            echo "  之后用户手改的提示词不会被续期轮反复覆盖。"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---------- 6.1 注册 MCP 服务器 ----------
       # 必须放在 Wait for health 之后：mcp_servers / agents / agent_visibility
